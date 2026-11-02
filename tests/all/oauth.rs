@@ -2148,3 +2148,67 @@ async fn trusted_browser_skips_the_second_factor() {
     let html = password_step(&s, &mut b, &f, &acct).await;
     assert!(html.contains("name=\"code\""), "trust survived a password change: {html}");
 }
+
+// ---------------------------------------------------------------- login_hint on the authorize URL
+
+/// The sign-in page's identifier field.
+fn identifier_value(html: &str) -> String {
+    let i = html.find("id=\"identifier\"").unwrap_or_else(|| panic!("no #identifier: {html}"));
+    let v = &html[i..];
+    let v = &v[v.find("value=\"").unwrap() + 7..];
+    v[..v.find('"').unwrap()].to_string()
+}
+
+/// A pushed request's page with `hint` on the authorize URL, in a new browser.
+async fn with_url_hint(s: &Srv, f: &Flow<'_>, hint: &str) -> Page {
+    let ru = f.request_uri(s, &pkce(), "h").await;
+    let url = format!("{}&login_hint={}", f.authorize_url(s, &ru), enc(hint));
+    Browser::default().get(s, &url).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn login_hint_on_the_authorize_url() {
+    let s = spawn().await;
+    let acct = create_account(&s, "urlhint").await;
+    let key = DpopKey::new();
+    let f = Flow::loopback("atproto", &key);
+    // a handle (normalized as PAR's is) and a DID fill in the form
+    for (hint, want) in [
+        (acct.handle.clone(), acct.handle.clone()),
+        (format!("@{}", acct.handle.to_uppercase()), acct.handle.clone()),
+        (acct.did.clone(), acct.did.clone()),
+    ] {
+        let (st, _, html) = with_url_hint(&s, &f, &hint).await;
+        assert_eq!(st, 200, "{html}");
+        assert_eq!(identifier_value(&html), want, "{hint}: {html}");
+    }
+    // the pushed request's hint wins
+    let pushed = Flow::loopback("atproto", &key).with("login_hint", &acct.handle);
+    let ru = pushed.request_uri(&s, &pkce(), "h").await;
+    let url = format!("{}&login_hint=someone-else.vlpds.test", pushed.authorize_url(&s, &ru));
+    let (_, _, html) = Browser::default().get(&s, &url).await;
+    assert_eq!(identifier_value(&html), acct.handle, "{html}");
+    // one that isn't a handle or DID is ignored, not an error
+    let (st, _, html) = with_url_hint(&s, &f, "not a handle!").await;
+    assert_eq!(st, 200, "{html}");
+    assert_eq!(identifier_value(&html), "", "{html}");
+    // kept on the request: the pages after this one have it, and the sign-in completes
+    let p = pkce();
+    let ru = f.request_uri(&s, &p, "h").await;
+    let mut b = Browser::default();
+    let url = format!("{}&login_hint={}", f.authorize_url(&s, &ru), enc(&acct.handle));
+    let (_, _, html) = b.get(&s, &url).await;
+    let (_, _, again) = b.get(&s, &format!("{}&screen=sign-in", f.authorize_url(&s, &ru))).await;
+    assert_eq!(identifier_value(&again), acct.handle, "{again}");
+    let (st, _, consent) = b.sign_in(&s, &ru, &csrf_of(&html), &acct.handle, PASSWORD).await;
+    assert_eq!(st, 200, "{consent}");
+    let rid = vlpds::oauth::store::request_id_from_uri(&ru).unwrap().to_string();
+    let req = vlpds::oauth::store::get_request(&s.app, &rid).await.unwrap().unwrap();
+    assert_eq!(req.params.login_hint.as_deref(), Some(acct.handle.as_str()));
+    // a browser signed in to the hinted account goes straight on (no sign-in form)
+    let ru = f.request_uri(&s, &pkce(), "h").await;
+    let url = format!("{}&login_hint={}", f.authorize_url(&s, &ru), enc(&acct.handle));
+    let (st, _, html) = b.get(&s, &url).await;
+    assert_eq!(st, 200, "{html}");
+    assert!(html.contains("Authorize access") && !html.contains("name=\"password\""), "{html}");
+}

@@ -549,14 +549,10 @@ async fn validate_authorization_request(
         }
     }
     let login_hint = match g("login_hint") {
-        Some(h) => {
-            let h = h.to_lowercase();
-            let h = h.strip_prefix('@').unwrap_or(&h).to_string();
-            if !is_atproto_did(&h) && !vlatproto::syntax::valid_handle(&h) {
-                return Err(OAuthError::invalid_request(&format!("Invalid login_hint \"{h}\"")));
-            }
-            Some(h)
-        }
+        Some(h) => match login_hint_of(&h) {
+            Ok(h) => Some(h),
+            Err(h) => return Err(OAuthError::invalid_request(&format!("Invalid login_hint \"{h}\""))),
+        },
         None => None,
     };
     if let Some(jkt) = g("dpop_jkt") {
@@ -1103,11 +1099,22 @@ async fn issue_code(app: &App, mut flow: Flow, did: &str) -> Response {
     r
 }
 
+/// A `login_hint`, normalized: a DID or a handle. Err: the normalized
+/// value, which is neither.
+fn login_hint_of(h: &str) -> Result<String, String> {
+    let h = h.to_lowercase();
+    let h = h.strip_prefix('@').unwrap_or(&h).to_string();
+    match is_atproto_did(&h) || vlatproto::syntax::valid_handle(&h) {
+        true => Ok(h),
+        false => Err(h),
+    }
+}
+
 async fn authorize(State(app): AppState, headers: HeaderMap, Query(q): Query<HashMap<String, String>>) -> Response {
     if !q.contains_key("client_id") {
         return error_page(&app, StatusCode::BAD_REQUEST, "Authorization failed", "Missing client_id");
     }
-    let flow = match load_flow(
+    let mut flow = match load_flow(
         &app,
         &headers,
         q.get("request_uri").map(String::as_str),
@@ -1118,6 +1125,18 @@ async fn authorize(State(app): AppState, headers: HeaderMap, Query(q): Query<Has
         Ok(f) => f,
         Err(e) => return e.into_response(&app),
     };
+    // login_hint on this URL, for a client that can't set it in the pushed
+    // request (@atproto/oauth-client-browser overwrites it there): the
+    // pushed one wins, and an invalid one is ignored. Kept on the request,
+    // so the pages after this one see it too.
+    if flow.req.params.login_hint.is_none() {
+        if let Some(Ok(h)) = q.get("login_hint").map(|h| login_hint_of(h)) {
+            flow.req.params.login_hint = Some(h);
+            if let Err(e) = store::put_request(&app, &flow.id, Some(&flow.req)).await {
+                return server_error_page(&app, "Authorization failed", &e.description);
+            }
+        }
+    }
     let accounts = device_accounts(&app, &flow.device).await;
     let params = flow.req.params.clone();
     let hint = params.login_hint.clone().unwrap_or_default();
