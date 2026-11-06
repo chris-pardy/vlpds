@@ -26,6 +26,10 @@ packages/lexicon/tests/general.test.ts; HTTP signature and token cases
 (src/space/{httpsig,token}.rs tests) from packages/space/src/http-signature.test.ts
 and packages/space/tests/credential.test.ts.
 
+The `star` entries in vectors.json, and export.star, were regenerated with the
+November 5 2026 release (0.0.0-spaces-alpha-20261105160032, commit 1cc3186d),
+which frames STAR with control bytes; the other entries are unchanged by it.
+
 License: MIT (bluesky-social/atproto).
 
 export.star and export.json (tests/all/spaces_side/import_repo.rs) are a space

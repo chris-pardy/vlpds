@@ -117,6 +117,7 @@ async fn a_huge_frame_is_refused_cheaply() {
     let as_path = |sc: &SpaceClient| {
         let mut header = Vec::new();
         vlpds::space::star::write_header(&mut header, &RepoBuilder::new(&o.space, &sc.did, &rev).build().commit);
+        header.push(vlpds::space::star::CONTROL_PAIR);
         bytes::Bytes::from(framed(&header, (32 << 20) - 64))
     };
     let as_meta = bytes::Bytes::from(framed(&vlpds::space::star::MAGIC, (32 << 20) - 64));

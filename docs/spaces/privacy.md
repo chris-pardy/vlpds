@@ -147,10 +147,18 @@ a block fails open ([Revocation](reading.md#revocation)).
 | Space | Taken down at its authority, by its space URI (`updateSubjectStatus` with a `strongRef`, or the console). `getSpaceCredential` answers `NotAuthorized`, `listRepos` and `registerNotify` answer `SpaceNotFound`, credential reads of members' repos on the authority's host answer `SpaceNotFound` too (a credential minted before the takedown included), and members' notifies are acknowledged and dropped. Registered syncers get no more forwards, the authority's own writes included. The records stay on their authors' hosts. A vlpds extension. |
 
 No credential names a taken-down account either. A taken-down account mints no delegation tokens,
-and `getSpaceCredential` refuses a taken-down member (`AccountTakedown`) and a space whose authority
-is taken down (`RepoTakendown`). The authority's host methods (`listRepos`, `registerNotify`,
-`unregisterNotify`) refuse a credential it issued before its takedown with `RepoTakendown`. The
-reference admits all of these.
+and `getSpaceCredential` refuses a taken-down member (`AccountTakedown`, which the reference
+admits).
+
+A space whose authority is taken down or deactivated is suspended, as in the reference since the
+November 5 alpha: `getSpaceCredential` and `listRepos` answer `RepoTakendown` or `RepoDeactivated`
+(`listRepos` to a credential issued before, too). It isn't deleted. Members' writes and their
+notifies still land and `registerNotify` still takes registrations, so the writer set stays current,
+and the space resumes when the account does. Managing it (`createSpace`, `updateSpace`,
+`deleteSpace`, `removeWriter`, `memberspace.putMember`, `removeMember`) is refused with
+`AccountTakedown` or `AccountDeactivated`, as public repo writes are. The reference also lets a
+taken-down account's `allowTakendown` session export its spaces; vlpds gives password sessions no
+space access at all, so that export needs the account restored first.
 
 The reference has no record takedown for space data at all, so record takedowns are a vlpds
 extension. The record stays in sR, and the LtHash stored with the head keeps it, the way a

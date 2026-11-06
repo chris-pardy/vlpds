@@ -254,16 +254,21 @@ fn swap_last_two_pairs(b: &[u8]) -> Vec<u8> {
     };
     frame(&mut pos);
     let mut pairs = Vec::new();
-    while pos < b.len() {
-        let k = frame(&mut pos);
+    // each pair from its 0x01 control byte; 0x00 ends the archive
+    while b[pos] == vlpds::space::star::CONTROL_PAIR {
+        let start = pos;
+        pos += 1;
+        frame(&mut pos);
         let v = frame(&mut pos);
-        pairs.push(k.start..v.end);
+        pairs.push(start..v.end);
     }
+    assert_eq!(&b[pos..], [vlpds::space::star::CONTROL_END]);
     let n = pairs.len();
     pairs.swap(n - 1, n - 2);
     let mut out = b[..pairs.iter().map(|r| r.start).min().unwrap()].to_vec();
     for r in pairs {
         out.extend_from_slice(&b[r]);
     }
+    vlpds::space::star::write_end(&mut out);
     out
 }

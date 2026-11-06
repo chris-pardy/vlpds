@@ -1,31 +1,36 @@
-//! STAR-lite v1 archives (@atproto/space `star.ts`), the `atproto-space-repo`
-//! profile getRepo serves: a header, then key/value pairs until EOF.
+//! STAR archives (<https://dasl.ing/star.html>, @atproto/star) and the
+//! `atproto-space-repo` profile getRepo serves: a header, then key/value
+//! pairs each preceded by a `0x01` control byte, then a `0x00` to end it.
 //!
 //! ```text
-//! [ magic | len | meta ] [ len | path | len | record ] [ len | path | len | record ] ...
+//! [ magic | len | meta ] [ 1 | len | path | len | record ] ... [ 0 ]
 //! ```
 //!
 //! The magic is `2a 6c 01 00`, each `len` an unsigned varint in its
 //! shortest form. The metadata is the repo's commit plus `"$type":
 //! "atproto-space-repo"`, as canonical DRISL; each pair is a record path
-//! (`{collection}/{rkey}`) and the record's DRISL bytes (at most 1 MiB), in
-//! strict bytewise order of the paths. The MAC is in the response's
-//! `Atproto-Space-Mac` header, not the archive.
-//!
-//! See <https://tangled.org/microcosm.blue/star/tree/main/v1-star>.
+//! (`{collection}/{rkey}`) and the record's DRISL bytes, in strict bytewise
+//! order of the paths. The profile caps the metadata at 64 KiB, a path at
+//! 4 KiB and a record at 1 MiB (the reference's `REPO_STAR_LIMITS`). The
+//! MAC is in the response's `Atproto-Space-Mac` header, not the archive.
 
 use super::commit::Commit;
 use super::lthash::LtHash;
 
 pub const MAGIC: [u8; 4] = [0x2a, 0x6c, 0x01, 0x00];
+/// Before each pair.
+pub const CONTROL_PAIR: u8 = 0x01;
+/// After the last pair: the archive is complete.
+pub const CONTROL_END: u8 = 0x00;
 pub const REPO_STAR_TYPE: &str = "atproto-space-repo";
 /// The largest record a space repo holds (the reference's `MAX_RECORD_SIZE`).
 pub const MAX_RECORD_SIZE: usize = 1 << 20;
-/// STAR's own frame limits; this profile's records are capped lower.
-pub const MAX_META_LENGTH: u64 = 64 << 20;
-pub const MAX_KEY_LENGTH: u64 = 64 << 20;
-/// A varint longer than this is refused (the reference reads 6 bytes).
-pub const MAX_VARINT_BYTES: usize = 6;
+/// Both Spaces profiles' metadata and key limits (`REPO_STAR_LIMITS`,
+/// `SPACE_META_STAR_LIMITS`); STAR itself sets none.
+pub const MAX_META_LENGTH: u64 = 64 << 10;
+pub const MAX_KEY_LENGTH: u64 = 4 << 10;
+/// A varint longer than this is refused (as @atproto/star).
+pub const MAX_VARINT_BYTES: usize = 9;
 
 /// The reference's `StarParseError`, and the profile's checks.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,12 +58,18 @@ pub fn write_header(out: &mut Vec<u8>, commit: &Commit) {
     out.extend_from_slice(&meta);
 }
 
-/// One record's pair.
+/// One record's pair, after its control byte.
 pub fn write_pair(out: &mut Vec<u8>, path: &[u8], record: &[u8]) {
+    out.push(CONTROL_PAIR);
     write_varint(out, path.len() as u64);
     out.extend_from_slice(path);
     write_varint(out, record.len() as u64);
     out.extend_from_slice(record);
+}
+
+/// The end of the archive, after the last pair.
+pub fn write_end(out: &mut Vec<u8>) {
+    out.push(CONTROL_END);
 }
 
 /// A varint at the front of `b`: Ok(None) when `b` ends before it does.
@@ -174,32 +185,66 @@ impl Archive {
     }
 }
 
-/// A whole archive: the header, the pairs to EOF, the digest. Its commit's
-/// MAC (and repo and space) are the caller's to check.
-pub fn parse(b: &[u8]) -> Result<Parsed, StarError> {
-    let rest = b.strip_prefix(&MAGIC[..]).ok_or_else(|| fail("invalid magic bytes"))?;
-    let mut pos = 0;
-    let mut frame = |max: u64, at_eof_ok: bool| -> Result<Option<&[u8]>, StarError> {
-        if pos == rest.len() && at_eof_ok {
-            return Ok(None);
-        }
-        let (len, n) = read_varint(&rest[pos..])?.ok_or_else(|| fail("unexpected end of archive"))?;
+/// Frame limits for [`read`], as @atproto/star's `ReadStarOptions`.
+#[derive(Clone, Copy, Debug)]
+pub struct Limits {
+    pub meta: u64,
+    pub key: u64,
+    pub value: u64,
+}
+
+/// The repo profile's limits (`REPO_STAR_LIMITS`).
+pub const REPO_LIMITS: Limits = Limits { meta: MAX_META_LENGTH, key: MAX_KEY_LENGTH, value: MAX_RECORD_SIZE as u64 };
+
+/// A whole STAR archive in memory, framing only (@atproto/star `readStar`):
+/// the metadata bytes and the pairs. Refuses EOF before the end byte, a
+/// control byte other than `0x00`/`0x01`, bytes after the end, and a frame
+/// over its limit (from its length, before it's read).
+pub fn read(b: &[u8], limits: Limits) -> Result<(&[u8], Vec<(&[u8], &[u8])>), StarError> {
+    fn frame<'a>(rest: &'a [u8], pos: &mut usize, max: u64) -> Result<&'a [u8], StarError> {
+        let (len, n) = read_varint(&rest[*pos..])?.ok_or_else(|| fail("unexpected end of archive"))?;
         if len > max {
             return Err(fail(format!("length {len} exceeds limit of {max}")));
         }
-        let start = pos + n;
-        let end = start
-            .checked_add(len as usize)
+        let start = *pos + n;
+        let end = usize::try_from(len)
+            .ok()
+            .and_then(|l| start.checked_add(l))
             .filter(|e| *e <= rest.len())
             .ok_or_else(|| fail("unexpected end of archive"))?;
-        pos = end;
-        Ok(Some(&rest[start..end]))
-    };
-    let meta = frame(MAX_META_LENGTH, false)?.ok_or_else(|| fail("missing metadata"))?;
+        *pos = end;
+        Ok(&rest[start..end])
+    }
+    let rest = b.strip_prefix(&MAGIC[..]).ok_or_else(|| fail("invalid magic bytes"))?;
+    let mut pos = 0;
+    let meta = frame(rest, &mut pos, limits.meta)?;
+    let mut pairs = Vec::new();
+    loop {
+        let control = *rest.get(pos).ok_or_else(|| fail("unexpected end of archive"))?;
+        pos += 1;
+        match control {
+            CONTROL_END => break,
+            CONTROL_PAIR => {
+                let key = frame(rest, &mut pos, limits.key)?;
+                let value = frame(rest, &mut pos, limits.value)?;
+                pairs.push((key, value));
+            }
+            c => return Err(fail(format!("invalid control byte: {c}"))),
+        }
+    }
+    if pos != rest.len() {
+        return Err(fail("unexpected bytes after end of archive"));
+    }
+    Ok((meta, pairs))
+}
+
+/// A whole repo archive: the header, the pairs, the digest. Its commit's
+/// MAC (and repo and space) are the caller's to check.
+pub fn parse(b: &[u8]) -> Result<Parsed, StarError> {
+    let (meta, pairs) = read(b, REPO_LIMITS)?;
     let mut a = Archive::new(parse_meta(meta)?);
-    let mut records = Vec::new();
-    while let Some(key) = frame(MAX_KEY_LENGTH, true)? {
-        let value = frame(MAX_RECORD_SIZE as u64, false)?.ok_or_else(|| fail("missing value for key"))?;
+    let mut records = Vec::with_capacity(pairs.len());
+    for (key, value) in pairs {
         let (path, _) = a.push(key, value)?;
         records.push((path, value.to_vec()));
     }
@@ -222,6 +267,7 @@ mod tests {
         for (p, r) in records {
             write_pair(&mut out, p.as_bytes(), r);
         }
+        write_end(&mut out);
         out
     }
 
@@ -249,6 +295,7 @@ mod tests {
             for (path, r) in &p.records {
                 write_pair(&mut out, path.as_bytes(), r);
             }
+            write_end(&mut out);
             assert_eq!(out, bytes);
             assert_eq!(p.records.len() as u64, c["records"].as_u64().unwrap());
         }
@@ -263,9 +310,11 @@ mod tests {
         assert_eq!(p.commit, commit);
         assert_eq!(p.records.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(), ["a.b.c/1", "a.b.c/2", "a.b.d/1"]);
 
-        // an empty repo has no pairs
+        // an empty repo has no pairs: the header, then the end byte
         let empty = commit_over(&[]);
-        assert!(parse(&archive(&empty, &[])).unwrap().records.is_empty());
+        let e = archive(&empty, &[]);
+        assert_eq!(e.last(), Some(&CONTROL_END));
+        assert!(parse(&e).unwrap().records.is_empty());
 
         // out of order, a duplicate
         let mut swapped = records.clone();
@@ -296,13 +345,60 @@ mod tests {
         let meta = commit.to_cbor(Some("other"));
         write_varint(&mut other, meta.len() as u64);
         other.extend_from_slice(&meta);
+        write_end(&mut other);
         assert!(parse(&other).unwrap_err().0.contains("$type"));
         let mut none = Vec::new();
         none.extend_from_slice(&MAGIC);
         let meta = commit.to_cbor(None);
         write_varint(&mut none, meta.len() as u64);
         none.extend_from_slice(&meta);
+        write_end(&mut none);
         assert!(parse(&none).is_err());
+    }
+
+    /// The November 5 framing: `0x01` before each pair, `0x00` to end, and
+    /// nothing else (@atproto/star's messages).
+    #[test]
+    fn control_bytes() {
+        let records = vec![("a.b.c/1", rec("one"))];
+        let commit = commit_over(&records);
+        let b = archive(&commit, &records);
+        let mut header = Vec::new();
+        write_header(&mut header, &commit);
+        assert_eq!(b[header.len()], CONTROL_PAIR);
+        assert_eq!(b.last(), Some(&CONTROL_END));
+        let err = |b: &[u8]| parse(b).unwrap_err().0;
+        // no end byte: truncated, not complete
+        assert_eq!(err(&b[..b.len() - 1]), "unexpected end of archive");
+        assert_eq!(err(&header), "unexpected end of archive");
+        // the October 29 framing (no control bytes) reads as a bad one
+        let mut old = header.clone();
+        write_varint(&mut old, 7);
+        old.extend_from_slice(b"a.b.c/1");
+        assert!(err(&old).starts_with("invalid control byte"), "{}", err(&old));
+        let mut two = b.clone();
+        two[header.len()] = 2;
+        assert_eq!(err(&two), "invalid control byte: 2");
+        let mut trailing = b.clone();
+        trailing.push(0);
+        assert_eq!(err(&trailing), "unexpected bytes after end of archive");
+    }
+
+    /// The profile's limits: 64 KiB of metadata, 4 KiB keys, 1 MiB values.
+    #[test]
+    fn limits() {
+        let commit = commit_over(&[]);
+        let mut long_key = Vec::new();
+        write_header(&mut long_key, &commit);
+        write_pair(&mut long_key, &vec![b'a'; 4097], &rec("x"));
+        write_end(&mut long_key);
+        assert_eq!(parse(&long_key).unwrap_err().0, "length 4097 exceeds limit of 4096");
+        let mut big_meta = MAGIC.to_vec();
+        write_varint(&mut big_meta, (64 << 10) + 1);
+        assert_eq!(parse(&big_meta).unwrap_err().0, "length 65537 exceeds limit of 65536");
+        // generic STAR sets none
+        let unlimited = Limits { meta: u64::MAX, key: u64::MAX, value: u64::MAX };
+        assert_eq!(read(&long_key, unlimited).unwrap().1.len(), 1);
     }
 
     #[test]
@@ -311,7 +407,8 @@ mod tests {
         assert_eq!(read_varint(&[0x80, 0x01]), Ok(Some((128, 2))));
         assert_eq!(read_varint(&[0x80]), Ok(None));
         assert!(read_varint(&[0x81, 0x00]).is_err(), "a padding zero");
-        assert!(read_varint(&[0xff; 7]).is_err());
+        assert_eq!(read_varint(&[0xff; 8]), Ok(None));
+        assert!(read_varint(&[0xff; 10]).is_err());
         let mut b = Vec::new();
         write_varint(&mut b, MAX_RECORD_SIZE as u64);
         assert_eq!(read_varint(&b), Ok(Some((MAX_RECORD_SIZE as u64, b.len()))));

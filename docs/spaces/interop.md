@@ -30,8 +30,13 @@ purpose, and `tests/REFERENCE_COVERAGE.md` lists each case.
 
 ## The pin
 
-The pin is the reference's October 22 alpha: bluesky-social/atproto branch `permissioned-data` at
-`ac0c9f15`, published as `0.0.0-spaces-alpha-20261022141228`. On top of the October 1 changes
+The pin is the reference's November 5 alpha: bluesky-social/atproto branch `permissioned-data` at
+`1cc3186d`, published as `0.0.0-spaces-alpha-20261105160032`. It frames STAR archives as DASL STAR
+(<https://dasl.ing/star.html>): a `0x01` before each pair and a `0x00` after the last, with both
+profiles' metadata capped at 64 KiB and keys at 4 KiB; the old framing is refused, so an archive
+saved before it (an `exportSpaceMeta` backup) has to be exported again. It also suspends a space
+whose authority is taken down or deactivated ([Takedowns](privacy.md#takedowns)). The October 29
+alpha before it replaced simplespace with policies. The October 22 alpha, on top of the October 1 changes
 (HTTP message signatures, 10-minute credentials with revocation, `repoRev`/`spaceRev`) it has
 credential requests with a JSON body and public spaces, the `Atproto-Space-Credential` scheme with
 a tagged signature, authorities resolved like any account (`#atproto_pds`, `#atproto`), unsigned
@@ -71,7 +76,8 @@ filters as the scope target, so an unfiltered listing needs a wildcard grant.
 | Backlinks | a like of a space URI is recorded as a backlink | public URIs only |
 | `sync.getBlob` with Spaces on | serves only publicly referenced blobs | the same. Without `--spaces`, vlpds still serves an upload before any record names it |
 | Space takedown | none | a vlpds extension: no credentials, no `listRepos` or registrations, notifies dropped |
-| Credentials for taken-down accounts | issued | refused for a taken-down member or authority |
+| Credentials for taken-down accounts | refused for a taken-down or deactivated authority, issued for a taken-down member | refused for both |
+| Exports after a takedown | `listSpaces`, `exportSpaceMeta`, `getRepo`, `listBlobs` and `getBlob` take an `allowTakendown` session | password sessions get no space access, so the account is restored first |
 
 ## Upstream gaps
 

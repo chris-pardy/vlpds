@@ -120,12 +120,29 @@ impl StarReader {
         Ok(())
     }
 
-    /// The next length-prefixed frame, None at the end (which only a pair
-    /// boundary may be). One longer than `max` is refused from its length,
-    /// before any of it is buffered.
-    async fn frame(&mut self, max: usize, what: &str) -> XResult<Option<Vec<u8>>> {
+    /// Whether another pair follows (its `0x01` control byte) or the
+    /// archive ends here (`0x00`, with nothing after it).
+    async fn next_pair(&mut self) -> XResult<bool> {
         if !self.fill(1).await? {
-            return Ok(None);
+            return Err(invalid("invalid STAR archive: unexpected end of archive"));
+        }
+        let control = self.buf[self.pos];
+        self.pos += 1;
+        match control {
+            star::CONTROL_PAIR => Ok(true),
+            star::CONTROL_END if self.fill(1).await? => {
+                Err(invalid("invalid STAR archive: unexpected bytes after end of archive"))
+            }
+            star::CONTROL_END => Ok(false),
+            c => Err(invalid(format!("invalid STAR archive: invalid control byte: {c}"))),
+        }
+    }
+
+    /// The next length-prefixed frame. One longer than `max` is refused
+    /// from its length, before any of it is buffered.
+    async fn frame(&mut self, max: usize, what: &str) -> XResult<Vec<u8>> {
+        if !self.fill(1).await? {
+            return Err(invalid("invalid STAR archive: unexpected end of archive"));
         }
         let (len, n) = loop {
             match star::read_varint(&self.buf[self.pos..]) {
@@ -147,7 +164,7 @@ impl StarReader {
         }
         let out = self.buf[self.pos..self.pos + len as usize].to_vec();
         self.pos += len as usize;
-        Ok(Some(out))
+        Ok(out)
     }
 }
 
@@ -331,8 +348,7 @@ async fn import(
     let body = super::import_stream::TimedBody::new(body, app.config.import_body_idle, app.config.import_body_deadline);
     let mut star = StarReader::new(body, max);
     star.magic().await?;
-    let meta =
-        star.frame(MAX_META, "metadata").await?.ok_or_else(|| invalid("invalid STAR archive: missing metadata"))?;
+    let meta = star.frame(MAX_META, "metadata").await?;
     let commit = star::parse_meta(&meta).map_err(|e| invalid(format!("invalid STAR archive: {e}")))?;
     if commit.ver != crate::space::commit::COMMIT_VERSION {
         return Err(invalid(format!("unsupported commit version {}", commit.ver)));
@@ -447,11 +463,9 @@ async fn stage(
     let mut collections: std::collections::BTreeSet<String> = Default::default();
     let mut muts = Vec::new();
     let mut bytes = 0;
-    while let Some(key) = star.frame(MAX_PATH, "record path").await? {
-        let b = star
-            .frame(star::MAX_RECORD_SIZE, "record")
-            .await?
-            .ok_or_else(|| invalid("invalid STAR archive: missing value for key"))?;
+    while star.next_pair().await? {
+        let key = star.frame(MAX_PATH, "record path").await?;
+        let b = star.frame(star::MAX_RECORD_SIZE, "record").await?;
         let (path, cid) = archive.push(&key, &b).map_err(|e| invalid(format!("invalid STAR archive: {e}")))?;
         let (collection, rkey) = path.split_once('/').unwrap_or_default();
         check_path(collection, Some(rkey))?;

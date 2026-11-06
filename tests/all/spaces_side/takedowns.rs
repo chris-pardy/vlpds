@@ -293,9 +293,10 @@ async fn taken_down_member_gets_no_credential() {
     t.net.mint_credential(&t.space, &token, None).await.0.ok();
 }
 
-/// A taken-down authority issues no credentials (RepoTakendown), even for
-/// members hosted elsewhere, and its host methods refuse credentials it
-/// issued before; restored, it issues again.
+/// A taken-down authority suspends its space (the November 5 alpha): no
+/// credentials (RepoTakendown), even for members hosted elsewhere, and no
+/// writer list for a credential it issued before. Registrations still
+/// land, so its state stays current; restored, it issues again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn taken_down_authority_issues_no_credentials() {
     let t = td().await;
@@ -305,11 +306,40 @@ async fn taken_down_authority_issues_no_credentials() {
     let (r, _) = t.net.mint_credential(&t.space, &token, None).await;
     assert!(r.json["credential"].is_null(), "{}", r.text());
     assert_eq!(r.error_name(), Some("RepoTakendown"), "{}", r.text());
-    let lr = before.get(&t.net.pds[0].url, "com.atproto.space.listRepos", &[("space", &t.space)]).await;
-    assert!((400..500).contains(&lr.status), "listRepos at a taken-down authority: {}", lr.text());
+    before
+        .get(&t.net.pds[0].url, "com.atproto.space.listRepos", &[("space", &t.space)])
+        .await
+        .err(400, "RepoTakendown");
+    let stub = super::hooks::StubDid::spawn().await;
+    let reg = json!({"space": t.space, "service": format!("{}#atproto_space_syncer", stub.did)});
+    before.post(&t.net.pds[0].url, "com.atproto.space.registerNotify", reg).await.ok();
     takedown_account(&t.net.pds[0], &t.alice.did, false).await;
     let token = delegation_token(&t.carol, &t.space).await;
     t.net.mint_credential(&t.space, &token, None).await.0.ok();
+}
+
+/// A deactivated authority suspends its space as a taken-down one does,
+/// with RepoDeactivated; members' writes still land, management is refused
+/// (AccountDeactivated), and reactivated, the space resumes with them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deactivated_authority_suspends_its_space() {
+    let t = td().await;
+    let before = t.net.credential_for(&t.carol, &t.space).await;
+    let token = delegation_token(&t.carol, &t.space).await;
+    let session = Auth::Bearer(t.alice.session_jwt.clone());
+    t.net.pds[0].xrpc.post("com.atproto.server.deactivateAccount", &json!({}), &session).await.ok();
+    let (r, _) = t.net.mint_credential(&t.space, &token, None).await;
+    assert_eq!(r.error_name(), Some("RepoDeactivated"), "{}", r.text());
+    let q = [("space", t.space.as_str())];
+    let list = || before.get(&t.net.pds[0].url, "com.atproto.space.listRepos", &q);
+    list().await.err(400, "RepoDeactivated");
+    t.bob_writes("while", "suspended").await;
+    put_member(&t.alice, &t.space, &t.carol, true, false).await.err(401, "AccountDeactivated");
+    t.net.pds[0].xrpc.post_empty("com.atproto.server.activateAccount", &session).await.ok();
+    let token = delegation_token(&t.carol, &t.space).await;
+    t.net.mint_credential(&t.space, &token, None).await.0.ok();
+    let repos = list().await.ok();
+    assert!(repos["repos"].as_array().unwrap().iter().any(|r| r["did"] == t.bob.did.as_str()), "{repos}");
 }
 
 /// A space takedown (vlpds extension, plan §2.8) at the authority's host:

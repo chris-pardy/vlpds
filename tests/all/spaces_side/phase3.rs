@@ -124,6 +124,7 @@ pub fn write_star(commit: &Commit, pairs: &[(String, Vec<u8>)]) -> Vec<u8> {
     for (p, b) in pairs {
         vlpds::space::star::write_pair(&mut out, p.as_bytes(), b);
     }
+    vlpds::space::star::write_end(&mut out);
     out
 }
 

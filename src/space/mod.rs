@@ -8,7 +8,7 @@
 //! - [`commit`]: the commit (repo, space, rev, data), unsigned.
 //! - [`kem`]: the per-request shared secret against `#atproto_kem`.
 //! - [`mac`]: commit and record MACs, and their headers.
-//! - [`star`]: getRepo's STAR archives.
+//! - [`star`]: STAR archives (DASL framing), getRepo's profile.
 //! - [`httpsig`]: the RFC 9421 subset requests with a space credential carry.
 //! - [`token`]: delegation tokens, space credentials, client attestations.
 //!

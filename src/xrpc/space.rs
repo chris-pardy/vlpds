@@ -1426,6 +1426,9 @@ async fn issue_credential(app: &App, inp: CredentialIn) -> XResult<Json<J>> {
     };
     let space = Space::parse(&inp.space)?;
     super::space_policy::assert_space_host(app, &space).await?;
+    // a suspended space: its authority taken down or deactivated
+    let (key, status) = super::proxy::account_key_status(app, &space.authority).await?;
+    assert_authority_active(&space.authority, status.as_deref())?;
     let client_id = match &inp.client_attestation {
         Some(a) => {
             let aud = token::space_host_aud(&space.authority);
@@ -1442,12 +1445,8 @@ async fn issue_credential(app: &App, inp: CredentialIn) -> XResult<Json<J>> {
     // told only to those it would otherwise admit: a non-member learns
     // nothing about the space from it
     let taken_down = space_takendown(app, &space).await?;
-    // vlpds: no credential names a taken-down authority or member (the
-    // reference admits both)
-    let (key, status) = super::proxy::account_key_status(app, &space.authority).await?;
-    if matches!(status.as_deref(), Some("takendown" | "suspended")) {
-        return Err(XrpcError::bad("RepoTakendown", "Space authority has been taken down"));
-    }
+    // vlpds: no credential names a taken-down member either (the
+    // reference admits one)
     if let Some(user) = user.as_deref().filter(|u| *u != space.authority) {
         match super::internal::account_anywhere(app, user).await {
             Ok(a) if matches!(a.status.as_deref(), Some("takendown" | "suspended")) => {
@@ -2142,9 +2141,10 @@ async fn get_repo(
                 flush_chunk(&tx, &mut buf, stall).await?;
             }
         }
-        if !buf.is_empty() {
-            flush_chunk(&tx, &mut buf, stall).await?;
-        }
+        // only a complete archive ends with it: a reader tells a cut-off
+        // stream from a whole one
+        star::write_end(&mut buf);
+        flush_chunk(&tx, &mut buf, stall).await?;
         Ok(())
     });
     Ok(with_mac(body, mac))
@@ -2286,6 +2286,22 @@ async fn notify_write_inner(app: &App, headers: &HeaderMap, inp: &J) -> XResult<
     process_notify_write(app, &space, repo, repo_rev, hash, SameRev::Verify).await
 }
 
+/// A space whose authority is taken down or deactivated is suspended (the
+/// reference's `assertActiveSpaceHost`): no credentials and no writer list,
+/// as `sync.*` refuses an inactive repo. Not deleted: writes, notifications
+/// and registrations still land, and it resumes when the account does.
+pub(super) fn assert_authority_active(authority: &str, status: Option<&str>) -> XResult<()> {
+    match status {
+        Some("takendown" | "suspended") => {
+            Err(XrpcError::bad("RepoTakendown", format!("Repo has been takendown: {authority}")))
+        }
+        Some("deactivated") => {
+            Err(XrpcError::bad("RepoDeactivated", format!("Repo has been deactivated: {authority}")))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// A request the space host answers for a credential holder only: the
 /// credential is this space's and addressed to the authority.
 /// The verified credential.
@@ -2296,14 +2312,6 @@ async fn host_credential(app: &App, headers: &HeaderMap, space: &Space) -> XResu
             assert_credential_space(audience, s, space, &space.authority)?
         }
         _ => return Err(XrpcError::internal("not a space credential")),
-    }
-    // a credential minted before the authority's takedown outlives it by up
-    // to its 300 s; getSpaceCredential's gate alone wouldn't stop it. An
-    // authority not hosted here is left to the callers' own checks.
-    if let Ok((_, Some(st))) = super::proxy::account_key_status(app, &space.authority).await {
-        if st == "takendown" || st == "suspended" {
-            return Err(XrpcError::bad("RepoTakendown", "Space authority has been taken down"));
-        }
     }
     Ok(cred)
 }
@@ -2345,6 +2353,12 @@ async fn list_repos(State(app): AppState, headers: HeaderMap, Query(q): Query<Li
     let space = Space::parse(&q.space)?;
     let limit = super::extract::limit_param(q.limit, 100, 1, 1000)?;
     host_credential(&app, &headers, &space).await?;
+    // a credential minted before the authority's takedown or deactivation
+    // outlives it by up to its 300 s; the writer list stops at once. An
+    // authority not hosted here is live_space's to refuse.
+    if let Ok((_, status)) = super::proxy::account_key_status(&app, &space.authority).await {
+        assert_authority_active(&space.authority, status.as_deref())?;
+    }
     super::space_policy::live_space(&app, &space).await?;
     if space_takendown(&app, &space).await? {
         return Err(super::space_policy::space_not_found());

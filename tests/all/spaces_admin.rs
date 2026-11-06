@@ -303,6 +303,7 @@ fn star(commit: &vlpds::space::commit::Commit, records: &[(String, Vec<u8>)]) ->
     for (p, r) in records {
         vlpds::space::star::write_pair(&mut out, p.as_bytes(), r);
     }
+    vlpds::space::star::write_end(&mut out);
     out
 }
 
