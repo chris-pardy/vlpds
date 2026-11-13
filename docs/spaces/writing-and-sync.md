@@ -30,9 +30,9 @@ timeline:
     - { from: app, to: w, at: 0.3, label: createRecord }
     - { from: w, to: store, at: 2.7 }
     - { from: w, to: app, at: 7.8, side: left, label: "200", tone: accent }
-    - { from: ob, to: host, at: 8.4, label: notifyWrite }
+    - { from: ob, to: host, at: 8.4, label: notifyRepoUpdate }
     - { from: host, to: ob, at: 13.2, label: "200" }
-    - { from: fan, to: sync, at: 13.8, label: "notifyWrite · spaceRev", tone: blue }
+    - { from: fan, to: sync, at: 13.8, label: "notifySpaceUpdate · repoWrite", tone: blue }
     - { from: sync, to: w, at: 16.1, side: left, label: listRepoOps, tone: blue }
     - { from: w, to: sync, at: 19.8, side: left, label: ops · commit · MAC, tone: blue }
   marks:
@@ -53,7 +53,8 @@ facts:
 
 A space write is durable before its 200, the same as a public commit. What's different is what
 happens next. Nothing goes on the firehose. The author's PDS tells the space's authority with
-`notifyWrite`, the authority puts the writer into a space-wide order, and syncers pull the new ops
+`notifyRepoUpdate`, the authority puts the writer into a space-wide order and tells registered
+syncers with `notifySpaceUpdate`, and syncers pull the new ops
 from the author's PDS.
 
 ## One write, one entry
@@ -94,16 +95,17 @@ edges:
   the published `com.atproto.space.policy` and `com.atproto.memberspace.member` records stay and the
   head covers them. A repo with nothing to delete is left alone. The authority hears the new rev like
   any write, and the repo stays in the writer set.
-- The space host's changes to a space (`createSpace`, `updateSpace`, `putMember`, `removeMember`)
+- The space host's changes to a space (`createSpace`, `updateSpace`, `putMembers`, `removeMembers`)
   write the config and the records it publishes in one entry on the authority's worker, as the
   authority's own write to its repo there.
 - An authority writing to its own space before it exists, or after it's deleted, gets
   `SpaceNotFound`. Its writer rows are written only for a live space.
-- `deleteSpace` tells each registered service with `notifySpaceDeleted`. A send that fails for a
-  reason worth retrying leaves an `sD` row, and the shard's owner retries it from 1 min, backing off
-  to 1 h, until it's delivered, refused for good, or the service's registration expires. A retry is
-  dropped once the space is created again or the authority's account is gone, and it waits while
-  the authority is inactive.
+- `deleteSpace` sends each registration, lapsed ones included, a `notifySpaceUpdate` with a
+  `spaceDeleted` update, 50 at a time. A send that fails for a reason worth retrying leaves an `sY`
+  row, and the shard's owner retries it after 1 min, 10 min, 1 h, 6 h, then every 12 h (50–100%
+  of each), until it's delivered, refused for good, or a retry fails after 72 h. A retry is dropped
+  once the space is created again or the authority's account is gone, and it waits while the
+  authority is inactive.
 - Space writes share segments the way public commits do. The in-tree bench measured 0.50 segment
   PUTs per write with 4 writers on one repo and 0.125 with 16, the same for space and public writes
   ([Operating](operating.md#server-cost-on-one-node)).
@@ -127,9 +129,9 @@ events:
   - { lane: w, at: 2.8, label: rev 2 }
   - { lane: w, at: 4.6, label: rev 3 }
 arrows:
-  - { from: ob, to: h, at: 1.0, label: notifyWrite }
+  - { from: ob, to: h, at: 1.0, label: notifyRepoUpdate }
   - { from: h, to: ob, at: 5.8, side: left, label: "200" }
-  - { from: ob, to: h, at: 6.6, label: notifyWrite }
+  - { from: ob, to: h, at: 6.6, label: notifyRepoUpdate }
   - { from: h, to: ob, at: 10.2, side: left, label: "200" }
 ```
 
@@ -139,7 +141,7 @@ or a takeover. The sending side lives in memory on the shard's owner.
 | | Behaviour |
 |---|---|
 | When it sends | as soon as nothing is in flight for that (repo, space), with no linger |
-| Where it sends | a local authority is told on its own worker with no HTTP. One on another cluster node gets `/internal/v1/space/notify`. When that node says the cluster doesn't host the authority, the sender remembers it for 5 min and goes straight to HTTP. Anything else gets `notifyWrite` at its `#atproto_pds` with the writer's service auth, a 10 s timeout and the SSRF-guarded client |
+| Where it sends | a local authority is told on its own worker with no HTTP. One on another cluster node gets `/internal/v1/space/notify`. When that node says the cluster doesn't host the authority, the sender remembers it for 5 min and goes straight to HTTP. Anything else gets `notifyRepoUpdate` at its `#atproto_pds` with the writer's service auth, a 10 s timeout and the SSRF-guarded client |
 | Retries | from 1 min, doubling to 1 h with 50–100% jitter, until 24 h after the rev was owed (written, renotified after a takedown, or found when its shard opened), not 24 h after the rev's own time, so an old rev (an import, a writer back from deactivation) gets its retries too. A permanent refusal drops the row |
 | Inactive writers | a taken-down or deactivated account's rows wait and resume on reactivation |
 | Cleanup | a delivered row's `sP` delete rides the author's next space write, so delivery costs no PUT |
@@ -149,24 +151,49 @@ or a takeover. The sending side lives in memory on the shard's owner.
 
 ```steps
 - title: Check the rev
-  body: "`repoRev` more than 5 min in the future gets `FutureRev`. The writer must pass the space's policy: under `memberspace` `publicWrite` or a member with `write`, under `managedspace` the managing app (`checkUserAccess` with `access=write`, no `clientId`), under `personalspace` only the authority."
+  body: "`repoRev` more than 5 min in the future gets `FutureRev`. The writer must pass the space's policy: under `memberspace` `publicWrite` or a member with `write`, under `managedspace` the managing app (`checkAccess` with the `repo` and no `clientId`, its `write` answer; one that can't answer is `UpstreamFailure` and the outbox retries), under `personalspace` only the authority."
 - title: Sequence it on the authority's worker
   body: "A `repoRev` below the writer's last one is a no-op, and so is the same `repoRev` with the same `data`, so a resent notify is harmless. The same `repoRev` with other `data` is a record takedown or its reversal changing what the writer serves ([Privacy](privacy.md#takedowns)), so it's sequenced again. From another host, it's sequenced only once the writer's PDS serves a commit with that `data` at that rev, its MAC verified against the writer's `#atproto_kem` key (the authority reads `getLatestCommit` with a credential it issues itself), and at most 3 times per writer and space in 10 min. The rest are dropped and left to polls. The push isn't logged either, so if the author's host crashes before it goes, syncers find out on their next poll. Otherwise the worker assigns the next `spaceRev` (a TID) and writes `sW` plus the `sQ` swap as one private entry. One worker per authority means no lock."
 - title: Leave the writer set
-  body: "`removeWriter`, `removeMember` and a `putMember` without write delete the writer's `sW` row and its `sQ` entry on the same worker. Nothing tells syncers, and the writer's records stay where they are. Its next write the policy allows puts it back. `updateSpace` leaves the writer set as it is."
+  body: "`removeWriter`, `removeMembers` and a `putMembers` without write sequence the removal on the same worker: the writer's `sW` row is kept and marked removed at a new spaceRev (the spaceRev never goes backward), and its `sQ` entry moves there. Registered syncers get a `repoRemoved`, and `listWriters` lists the repo as `repoRemoved` until it writes again. Only a newer rev brings it back. The writer's records stay where they are, and `exportSpaceMeta` leaves it out. `updateSpace` leaves the writer set as it is."
 - title: Answer 200 once it's durable
   body: "The writer's outbox only drops its row after this."
 - title: Fan out
-  body: "Sequenced writes leave the worker in ack order for the fan-out, off the request path."
+  body: "Sequenced writes and removals leave the worker in ack order for the fan-out, off the request path."
 ```
+
+## Notify registrations
+
+A syncer registers for a space's updates when it authorizes: `authorizeSpaceSync` takes an optional
+`notify` with an `endpoint` and a `token`. The pair is the registration, and it's active until the
+`exp` of the credential issued with it. Each authorization carrying the same pair renews it, and a
+different token is a separate registration.
+
+- A new registration is confirmed first. The space host calls `confirmRegistration` on the endpoint
+  with the space, the token and a random challenge, and the endpoint must echo the challenge. If it
+  doesn't, or can't be reached, the request fails with `RegistrationNotConfirmed`.
+- A refusal by the policy (a 4xx) withdraws the registration the request carries. A failure to
+  decide (`UpstreamFailure`, a managing app that can't answer) doesn't.
+- Each update is a `notifySpaceUpdate` `{space, token, update}` to the endpoint, with no service
+  auth. The syncer knows its token.
+- A registration that lapsed gets no more updates. The first update after it lapsed is claimed
+  once and replaced by a `registrationExpired` notice, sent and retried like a deletion notice. After
+  that it gets nothing but a deletion notice until it authorizes again. A syncer that rejects its
+  expiry notice, or can't be reached within the 72 h, is unregistered, unless it renewed meanwhile.
+- An endpoint is at most 2,048 bytes and `http(s)`, a token at most 512. A space holds 256
+  registrations, lapsed ones included: past that a new one takes the place of the one that lapsed
+  longest ago, and is refused when none has. One authority's spaces hold 1,024 active ones together,
+  and new ones are confirmed at most 60 an hour per space and endpoint host (`space-register`). An
+  account governs 1,000 live spaces at most and creates 100 a day. Every call to an endpoint goes
+  over the SSRF-guarded client.
 
 ## Fan-out
 
 ```diagram
-caption: "Each (space, service) gets its own lane, which sends one forward at a time in spaceRev order. A slow syncer holds up only its own lane. Bounds are per lane (256), per service host (4,096 queued, 16 sends in flight, with a host counted by its registrable domain or IP address, and each tenant of a hosting platform like fly.dev or github.io counted as its own host), per dispatcher (8 of them, 4,096 queued each), 65,536 queued and 16,384 lanes in all, and 512 sends in flight in all."
+caption: "Each (space, registration) gets its own lane, which sends one forward at a time in spaceRev order. A slow syncer holds up only its own lane. Bounds are per lane (256), per endpoint host (4,096 queued, 16 sends in flight, with a host counted by its registrable domain or IP address, and each tenant of a hosting platform like fly.dev or github.io counted as its own host), per dispatcher (8 of them, 4,096 queued each), 65,536 queued and 16,384 lanes in all, and 512 sends in flight in all."
 nodes:
   - { id: hw, label: Authority's worker, sub: acks in spaceRev order, at: [0, 4], size: [9, 3], tone: violet }
-  - { id: d, label: Dispatcher, sub: reads `sN` registrations, at: [12.5, 4], size: [9, 3], tone: violet }
+  - { id: d, label: Dispatcher, sub: reads `sG` registrations, at: [12.5, 4], size: [9, 3], tone: violet }
   - { id: l1, label: Lane, sub: space · syncer A, at: [25, 0], size: [9, 2.6], tone: violet }
   - { id: l2, label: Lane, sub: space · syncer B, at: [25, 4.2], size: [9, 2.6], tone: violet }
   - { id: l3, label: Lane, sub: space · syncer C, at: [25, 8.4], size: [9, 2.6], tone: violet }
@@ -178,7 +205,7 @@ edges:
   - d.r -> l1.l
   - d.r -> l2.l
   - d.r -> l3.l
-  - "l1 -> s1: notifyWrite"
+  - "l1 -> s1: notifySpaceUpdate"
   - l2 -> s2
   - { from: l3, to: s3, label: retry · backoff, dash: true }
 ```
@@ -189,21 +216,22 @@ edges:
   replaced forward leaves no gap. After a forward lost for good (a full queue, retries run out), and
   on the first forward to each registration after the shard changes hands, it's the spaceRev
   sequenced just before, which `sQ` keeps. The syncer may never have heard that one, and the gap
-  sends it to `listRepos`. That's fine. What must never happen is two forwards naming one
+  sends it to `listWriters`. That's fine. What must never happen is two forwards naming one
   `prevSpaceRev` with different successors, a fork in the chain the syncer follows, and a lane's
   memory from before a takeover could do that. The takeover tests check no syncer ever sees one.
 - A failed forward is retried with jittered backoff from 1 s, but only while nothing newer from its
   writer waits.
-- Registrations (`registerNotify`) last 24 h, and a space takes 256 at most, one authority's spaces 1,024 together, and one credential makes 60 an hour. An account governs 1,000 live spaces at most and creates 100 a day. A did:web can point each of its fragments at its own address, so only these and the global queue and lane caps keep slow endpoints from growing the fan-out's memory: past them a lane's oldest forward goes, marked as a gap, and a syncer catches up with `listRepos`. Expired ones are pruned. The prune's delete runs on the authority's worker and checks the expiry again there, so a syncer that renews while a prune is under way keeps its registration.
+- The registration caps above and the global queue and lane caps keep slow endpoints from growing the fan-out's memory: past them a lane's oldest forward goes, marked as a gap, and a syncer catches up with `listWriters`. A forward to a registration that lapsed while it was failing is dropped (`expired`).
 - Lanes live in memory. When a shard opens on a new owner, each of its spaces with a live
   registration sends one catch-up forward of its newest writer, naming the spaceRev before it. A
-  syncer that's current ignores it, and one that missed a forward sees the gap and pulls `listRepos`.
+  syncer that's current ignores it, and one that missed a forward sees the gap and pulls `listWriters`.
   A catch-up that a newer write has passed by the time it's sent is dropped, so forwards stay in
   spaceRev order.
 - A taken-down space forwards nothing, catch-ups included.
 
-The reference sends each forward as it's sequenced, with no order. Its syncers see about 3–5
-`prevSpaceRev` gaps per ~80 forwards, and each one costs a `listRepos` call.
+The reference sends each update to a space's registrations in parallel as it's sequenced, with no
+order. Its syncers saw about 3–5 `prevSpaceRev` gaps per ~80 forwards on the Nov 5 wire, and each
+one costs a `listWriters` call.
 
 ## How a syncer pulls
 
@@ -212,11 +240,12 @@ The reference sends each forward as it's sequenced, with no order. Its syncers s
 | `listRepoOps`, `since` = head | the in-memory head, no state read | 0.28 ms p50 · 0.54 ms p99 · 0.12 ms server · 0 bucket ops | 6.7 ms p50 |
 | `listRepoOps`, a delta | a range scan of `sO` from `since`, values joined from `sR` | 0.41 ms p50 · 1.9 ms p99 · 0.17 ms server | 8.3 ms |
 | `getRepo` | one streamed pass over one snapshot, under an export slot, as a STAR archive | bounded by the 100k record cap | |
-| `listRepos` (at the authority) | a cursor scan of `sQ` joined to `sW` | | |
+| `listWriters` (at the authority) | a cursor scan of `sQ` joined to `sW`, each entry a `repoWrite` or a `repoRemoved` | | |
 
-When a page of `listRepoOps` reaches the head it includes the commit, and the response carries an
-`Atproto-Space-Mac` header for the syncer's `key_share`. The syncer checks the MAC, then its
-running LtHash against the commit's `data`. If they differ it falls back to
+Every page of `listRepoOps` includes the repo's current commit, and the response carries it in an
+`Atproto-Space-Commit` header signed for the syncer's key (the `Accept-Signature` it sent). A full
+page has a cursor. A repo never written answers `RepoNotFound`. The syncer checks the MAC on each
+page, and once it has paged to the head, its running LtHash against the commit's `data`. If they differ it falls back to
 `getRepo`. That's also what happens when `since` is older than the 7-day oplog window, since vlpds
 answers from the window's start and the replayed hash can't match. Numbers are client-side from the
 interop harness at `8f837fa8` (one node, MinIO).
@@ -236,7 +265,7 @@ spans:
   - { lane: n, from: 0, to: 2.3, label: build · batch }
   - { lane: s, from: 2.5, to: 5, label: segment PUT, tone: amber }
   - { lane: n, from: 5.2, to: 7.2, label: apply · ack }
-  - { lane: ob, from: 7.6, to: 12.4, label: send notifyWrite }
+  - { lane: ob, from: 7.6, to: 12.4, label: send notifyRepoUpdate }
   - { lane: h, from: 8, to: 11.4, label: sequence · PUT, tone: violet }
   - { lane: n, from: 14.4, to: 17.4, label: next space write }
 arrows:
@@ -255,7 +284,7 @@ marks:
 | 1 | before the segment is durable | no 200 | Nothing to replay. The app retries. |
 | 2 | durable, before the 200 | no 200 | The next owner replays the entry, `sP` row included, so the notify still goes out. A blind retry is a second write. |
 | 3 | after the 200, before the authority's 200 | the 200 | The `sP` row is in the bucket. Whichever node opens the shard next rescans `sP` and sends the newest rev. |
-| 4 | at the authority, after its entry is durable | the 200 | The authority keeps the spaceRev. The fan-out was only in memory, so the next owner sends each registration one catch-up forward, and a syncer that missed one catches up with `listRepos`. |
+| 4 | at the authority, after its entry is durable | the 200 | The authority keeps the spaceRev. The fan-out was only in memory, so the next owner sends each registration one catch-up forward, and a syncer that missed one catches up with `listWriters`. |
 | 5 | delivered, before the `sP` delete lands | the 200 | The row is resent once. The authority ignores a `repoRev` it has already seen. |
 
 The reference stores a notify for retry only after a send fails, so an acked write's notify can be

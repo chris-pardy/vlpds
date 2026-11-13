@@ -23,7 +23,7 @@ const COLL2: &str = "com.example.reply";
 const SCOPE: &str = "space:com.example.group?collection=com.example.post&collection=com.example.reply&action=read&action=create&manage=create";
 const ANY_SCOPE: &str =
     "space:com.example.group?authority=*&collection=com.example.post&action=read&action=create&action=read_self";
-const REVOKE: &str = "com.atproto.space.notifyCredentialRevoked";
+const REVOKE: &str = "com.atproto.space.notifyCredentialsRevoked";
 
 fn rec(text: &str) -> J {
     json!({"$type": COLL, "text": text, "createdAt": "2026-10-01T00:00:00.000Z"})
@@ -103,7 +103,7 @@ impl Stub {
                 };
                 match req.uri().path() {
                     "/.well-known/did.json" => json(200, doc),
-                    "/xrpc/com.atproto.space.notifyWrite" => {
+                    "/xrpc/com.atproto.space.notifyRepoUpdate" => {
                         let body = axum::body::to_bytes(req.into_body(), 1 << 20).await.unwrap();
                         n.lock().push(serde_json::from_slice(&body).unwrap());
                         let s = *st.lock();
@@ -213,7 +213,7 @@ async fn expired_credential_falls_out_of_the_cache() {
     assert!(spaces(&s).credentials.is_empty());
 }
 
-/// notifyCredentialRevoked: the authority revokes by jti, scoped to its
+/// notifyCredentialsRevoked: the authority revokes by jti, scoped to its
 /// space, enforced at once on this node and after a restart; only the
 /// space's authority may revoke, only to an account hosted here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -250,7 +250,7 @@ async fn revocation_is_durable_scoped_and_authorized() {
         .err(403, "Forbidden");
     let frag = format!("{}#atproto_space_host", m.did);
     revoke(&first, &stub.service_jwt(&frag, REVOKE), &sp1, &["j1"]).await.err(403, "Forbidden");
-    let wrong_lxm = stub.service_jwt(&m.did, "com.atproto.space.notifyWrite");
+    let wrong_lxm = stub.service_jwt(&m.did, "com.atproto.space.notifyRepoUpdate");
     revoke(&first, &wrong_lxm, &sp1, &["j1"]).await.err(401, "BadJwtLexiconMethod");
     // naming the authority, signed by another key
     let forged = vlpds::auth::service_auth_jwt(&other.key, &stub.did, &m.did, Some(REVOKE), 60).unwrap();
@@ -512,7 +512,7 @@ async fn list_spaces_with_filters() {
         }
     };
     let uris = |j: &J| {
-        j["spaces"].as_array().unwrap().iter().map(|s| s["uri"].as_str().unwrap().to_string()).collect::<Vec<_>>()
+        j["spaces"].as_array().unwrap().iter().map(|s| s["space"].as_str().unwrap().to_string()).collect::<Vec<_>>()
     };
     let mut all = vec![one.clone(), two.clone(), three.clone(), remote.clone()];
     all.sort();
@@ -520,9 +520,19 @@ async fn list_spaces_with_filters() {
     assert_eq!(uris(&r), all);
     assert!(r.get("cursor").is_none());
     assert_eq!(uris(&list(vec![("spaceType", OTHER.into())]).await.ok()), std::slice::from_ref(&three));
-    assert_eq!(uris(&list(vec![("did", stub.did.clone())]).await.ok()), std::slice::from_ref(&remote));
-    let mine = list(vec![("did", a.did.clone()), ("spaceType", TYPE.into())]).await.ok();
+    assert_eq!(uris(&list(vec![("spaceDid", stub.did.clone())]).await.ok()), std::slice::from_ref(&remote));
+    let mine = list(vec![("spaceDid", a.did.clone()), ("spaceType", TYPE.into())]).await.ok();
     assert_eq!(uris(&mine), [one.clone(), two.clone()]);
+    // each with the caller's repoRev and data there, and a governed
+    // space's spaceRev; another authority's space has no spaceRev here
+    let entry = |j: &J, uri: &str| j["spaces"].as_array().unwrap().iter().find(|s| s["space"] == json!(uri)).cloned();
+    let remote_entry = entry(&r, &remote).unwrap();
+    assert!(remote_entry["repoRev"].is_string() && remote_entry["data"]["$bytes"].is_string(), "{remote_entry}");
+    assert!(remote_entry.get("spaceRev").is_none(), "{remote_entry}");
+    let head = a.get("com.atproto.space.getLatestCommit", &[("space", &remote), ("repo", &a.did)]).await.ok();
+    assert_eq!(remote_entry["repoRev"], head["commit"]["rev"]);
+    assert_eq!(remote_entry["data"], head["commit"]["data"]);
+    list(vec![("cursor", "not a space".into())]).await.err(400, "InvalidCursor");
     // pages
     let p1 = list(vec![("limit", "3".into())]).await.ok();
     assert_eq!(uris(&p1), all[..3]);
@@ -535,7 +545,7 @@ async fn list_spaces_with_filters() {
     let g = SpaceClient::new(&s, "slg", "space:com.example.group?action=read_self&manage=create").await;
     g.get("com.atproto.space.listSpaces", &[]).await.err(403, "ScopeMissingError");
     g.get("com.atproto.space.listSpaces", &[("spaceType", TYPE)]).await.err(403, "ScopeMissingError");
-    let gq = [("spaceType", TYPE), ("did", g.did.as_str())];
+    let gq = [("spaceType", TYPE), ("spaceDid", g.did.as_str())];
     assert!(uris(&g.get("com.atproto.space.listSpaces", &gq).await.ok()).is_empty());
     // legacy auth: nothing
     let session = Auth::Bearer(a.session_jwt.clone());
@@ -553,7 +563,7 @@ async fn list_spaces_one_type_grant() {
     let a = SpaceClient::new(&s, "slt", &format!("{app} blob:*/* repo:*")).await;
     let space = a.create_space(TYPE, "one").await;
     let uris = |j: &J| {
-        j["spaces"].as_array().unwrap().iter().map(|s| s["uri"].as_str().unwrap().to_string()).collect::<Vec<_>>()
+        j["spaces"].as_array().unwrap().iter().map(|s| s["space"].as_str().unwrap().to_string()).collect::<Vec<_>>()
     };
     let wildcard = |r: Resp| {
         r.err(403, "ScopeMissingError");
@@ -563,7 +573,7 @@ async fn list_spaces_one_type_grant() {
     wildcard(a.get("com.atproto.space.listSpaces", &[]).await);
     let listed = a.get("com.atproto.space.listSpaces", &[("spaceType", TYPE)]).await.ok();
     assert_eq!(uris(&listed), std::slice::from_ref(&space));
-    let mine = a.get("com.atproto.space.listSpaces", &[("spaceType", TYPE), ("did", &a.did)]).await.ok();
+    let mine = a.get("com.atproto.space.listSpaces", &[("spaceType", TYPE), ("spaceDid", &a.did)]).await.ok();
     assert_eq!(uris(&mine), std::slice::from_ref(&space));
     let other = a.get("com.atproto.space.listSpaces", &[("spaceType", "com.example.otherType")]).await;
     other.err(403, "ScopeMissingError");
@@ -646,13 +656,13 @@ async fn list_spaces_index_pages() {
             for _ in 0..100 {
                 let mut q = vec![("limit", limit.to_string())];
                 q.extend(t.map(|t| ("spaceType", t.to_string())));
-                q.extend(d.map(|d| ("did", d.to_string())));
+                q.extend(d.map(|d| ("spaceDid", d.to_string())));
                 q.extend(cursor.clone().map(|c| ("cursor", c)));
                 let q: Vec<(&str, &str)> = q.iter().map(|(k, v)| (*k, v.as_str())).collect();
                 let r = a.get("com.atproto.space.listSpaces", &q).await.ok();
                 let page = r["spaces"].as_array().unwrap();
                 assert!(page.len() <= limit, "{r}");
-                got.extend(page.iter().map(|s| s["uri"].as_str().unwrap().to_string()));
+                got.extend(page.iter().map(|s| s["space"].as_str().unwrap().to_string()));
                 match r["cursor"].as_str() {
                     Some(c) => {
                         assert_eq!(page.len(), limit, "a cursor on a short page: {r}");
@@ -668,12 +678,12 @@ async fn list_spaces_index_pages() {
     let mid = own(OTHER, "b05x");
     let r = a.get("com.atproto.space.listSpaces", &[("cursor", mid.as_str())]).await.ok();
     let after: Vec<&String> = want.iter().filter(|u| **u > mid).take(50).collect();
-    let got: Vec<&str> = r["spaces"].as_array().unwrap().iter().map(|s| s["uri"].as_str().unwrap()).collect();
+    let got: Vec<&str> = r["spaces"].as_array().unwrap().iter().map(|s| s["space"].as_str().unwrap()).collect();
     assert_eq!(got, after);
 }
 
-/// listRecords: newest URI first by default, `reverse` oldest first, a
-/// `collection` filter, and a cursor that pages either way.
+/// listRecords: newest URI first (`reverse` is gone since the Nov 12
+/// alpha, so it changes nothing), a `collection` filter, and a cursor.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn list_records_paging() {
     let s = spawn().await;
@@ -720,11 +730,13 @@ async fn list_records_paging() {
     asc.extend((1..=2).map(|i| format!("{COLL2}/q{i}")));
     let desc: Vec<String> = asc.iter().rev().cloned().collect();
     assert_eq!(walk(vec![]).await, desc);
-    assert_eq!(walk(vec![("reverse", "true".into())]).await, asc);
+    assert_eq!(walk(vec![("reverse", "true".into())]).await, desc);
     assert_eq!(walk(vec![("collection", COLL2.into())]).await, desc[..2]);
-    assert_eq!(walk(vec![("collection", COLL.into()), ("reverse", "true".into())]).await, asc[..5]);
+    assert_eq!(walk(vec![("collection", COLL.into())]).await, desc[2..]);
     let first = page(vec![("limit", "1".into())]).await;
     assert_eq!(first["cursor"], json!(format!("{space}/{}/{COLL2}/q2", a.did)));
+    let q = [("space", space.as_str()), ("repo", a.did.as_str()), ("cursor", "not a uri")];
+    a.signed_get(&s.url, "com.atproto.space.listRecords", &q, &cred, &a.did).await.err(400, "InvalidCursor");
     let bare = page(vec![("excludeValues", "true".into())]).await;
     assert!(bare["records"].as_array().unwrap().iter().all(|r| r.get("value").is_none() && r["cid"].is_string()));
 }

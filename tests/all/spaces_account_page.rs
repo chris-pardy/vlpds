@@ -6,7 +6,7 @@
 //! is checked in `oauth::client`'s unit tests (a web client can't redirect
 //! to 127.0.0.1).
 
-use crate::common::spaces::SpaceClient;
+use crate::common::spaces::{put_members, remove_members, SpaceClient};
 use crate::common::*;
 use crate::oauth::{as_post, enc, exchange, grant, pkce, tokens, xrpc_dpop, Account, Browser, DpopKey, Flow, Srv};
 
@@ -65,11 +65,19 @@ async fn first_party_read_then_owner_grant() {
     let q = format!("space={}", enc(&space));
     let listed = get(read.access.clone(), "com.atproto.space.listSpaces", String::new()).await;
     assert_eq!(listed.status, 200, "{}", listed.body);
-    assert!(listed.body["spaces"].as_array().unwrap().iter().any(|x| x["uri"] == space.as_str()), "{}", listed.body);
+    assert!(listed.body["spaces"].as_array().unwrap().iter().any(|x| x["space"] == space.as_str()), "{}", listed.body);
     assert_eq!(get(read.access.clone(), "com.atproto.space.getSpace", q.clone()).await.status, 200);
     assert_eq!(get(read.access.clone(), "com.atproto.memberspace.listMembers", q.clone()).await.status, 200);
     let put = json!({"space": space, "did": member.did, "read": true, "write": false});
-    let r = xrpc_dpop(&srv, &key, &read.access, "POST", "com.atproto.memberspace.putMember", Some(put.clone())).await;
+    let r = xrpc_dpop(
+        &srv,
+        &key,
+        &read.access,
+        "POST",
+        "com.atproto.memberspace.putMembers",
+        Some(put_members(put.clone())),
+    )
+    .await;
     assert_eq!(r.status, 403, "{}", r.body);
 
     // the owner grant, requested on top of the first: `self` comes back as the user's DID
@@ -87,12 +95,12 @@ async fn first_party_read_then_owner_grant() {
         let (srv, key2, tok) = (&srv, &key2, ownerg.access.clone());
         async move { xrpc_dpop(srv, key2, &tok, "POST", nsid, Some(body)).await }
     };
-    assert_eq!(post("com.atproto.memberspace.putMember", put).await.status, 200);
+    assert_eq!(post("com.atproto.memberspace.putMembers", put_members(put)).await.status, 200);
     let m =
         xrpc_dpop(&srv, &key2, &ownerg.access, "GET", &format!("com.atproto.memberspace.listMembers?{q}"), None).await;
     assert_eq!(m.body["members"], json!([{"did": member.did, "read": true, "write": false}]));
     let rm = json!({"space": space, "did": member.did});
-    assert_eq!(post("com.atproto.memberspace.removeMember", rm).await.status, 200);
+    assert_eq!(post("com.atproto.memberspace.removeMembers", remove_members(rm)).await.status, 200);
     // someone else's space stays out of reach
     let r = post("com.atproto.space.deleteSpace", json!({"space": theirs})).await;
     assert_eq!(r.status, 403, "{}", r.body);

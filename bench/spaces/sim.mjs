@@ -12,10 +12,11 @@
 // Invariants, checked after the workload and a quiet period:
 //   I1 no lost acked write: every repo host's own listing equals the acked writes
 //   I2 the authority tracks every writer at its latest repoRev (notify eventually delivered)
-//   I3 every syncer converges: for each repo listRepos names, the syncer's copy is
-//      the acked state (active writers) and its LtHash equals the verified commit
-//   I4 spaceRev: strictly ascending in listRepos; no spaceRev assigned to two
-//      different (repo, repoRev); the prevSpaceRev chain never forks
+//   I3 every syncer converges: for each repo listWriters names, the syncer's copy is
+//      the acked state (active writers) and its LtHash equals the verified commit,
+//      and it holds nothing for a repo listed as removed
+//   I4 spaceRev: strictly ascending in listWriters; no spaceRev assigned to two
+//      different updates; the prevSpaceRev chain never forks
 //   I5 syncers never saw a protocol violation (cursor, ordering, rev going back)
 import { Actor, RUN } from './lib/actor.mjs'
 import { COLL, HOSTS, PORTS, log } from './lib/env.mjs'
@@ -24,7 +25,7 @@ import { setService } from './lib/identity.mjs'
 import { FaultProxy } from './lib/faultproxy.mjs'
 import { NotifyService } from './lib/notifysvc.mjs'
 import { Report, summarize } from './lib/report.mjs'
-import { createSpace, credentialFor, headOf, putMember, spaceUri } from './lib/space.mjs'
+import { createSpace, credentialFor, headOf, putMember, removeMember, spaceUri } from './lib/space.mjs'
 import { Syncer, hashEq } from './lib/syncer.mjs'
 import { Vlpds } from './lib/vlpds.mjs'
 
@@ -144,9 +145,9 @@ async function setup(check, env) {
     if (FAULTS && !env.hostProxies[authority.host]) {
       // the writer -> authority hop goes through a proxy: the authority's
       // #atproto_pds (its space host) names it, signed with the host's test
-      // rotation key; everything but notifyWrite passes straight through
+      // rotation key; everything but notifyRepoUpdate passes straight through
       const port = PORTS.hostProxy[authority.host]
-      const px = await new FaultProxy(port, HOSTS[authority.host].url, { match: /notifyWrite/ }).start()
+      const px = await new FaultProxy(port, HOSTS[authority.host].url, { match: /notifyRepoUpdate/ }).start()
       px.rand = mulberry32(seed + 200 + port)
       env.hostProxies[authority.host] = px
     }
@@ -171,15 +172,15 @@ async function setup(check, env) {
   const syncers = []
   for (const sp of spaces) {
     for (let k = 0; k < SC.syncers; k++) {
-      const s = new Syncer(`syncer${k}/space${sp.n}`, sp.uri, sp.reader)
+      // the syncer registers (and renews) with every authorization it makes
+      const s = new Syncer(`syncer${k}/space${sp.n}`, sp.uri, sp.reader, { notify: () => env.svcs[k].register(sp.uri) })
       s.svc = k
       syncers.push(s)
-      const cred = await credentialFor(sp.reader, sp.uri)
-      await (await cred.hostClient()).com.atproto.space.registerNotify({ space: sp.uri, service: env.svcs[k].serviceRef })
       env.svcs[k].on((call) => {
-        if (call.lxm === 'com.atproto.space.notifyWrite' && call.body.space === sp.uri) s.notify(call.body)
+        if (call.lxm === 'com.atproto.space.notifySpaceUpdate' && call.body.space === sp.uri) s.notify(call.body)
       })
       await s.sync()
+      if (s.lastError) throw s.lastError
     }
   }
   check(true, `${spaces.length} spaces x ${SC.syncers} registered syncers`)
@@ -273,19 +274,31 @@ async function workload(world, env, stats, ackTimes) {
   void env
 }
 
+/** A membership change is idempotent: through a crash or a 5xx, send it again until it lands. */
+async function retried(fn) {
+  for (let i = 0; ; i++) {
+    try {
+      return await fn()
+    } catch (e) {
+      if (i >= 40 || (typeof e?.status === 'number' && e.status < 500 && !['RepoLoading', 'ShardMoved'].includes(e.error))) throw e
+      await sleep(500)
+    }
+  }
+}
+
 async function membership(sp, stats) {
   stats.membership++
   const candidates = sp.writers.filter((w) => w !== sp.authority)
   if (sp.removed.size && chance(0.5)) {
     const did = pick([...sp.removed])
-    await putMember(sp.authority, sp.uri, did, true, true)
+    await retried(() => putMember(sp.authority, sp.uri, did, true, true))
     sp.removed.delete(did)
     // writes made while removed were never tracked; the next one catches the authority up
     sp.repos.get(did).stale = true
   } else if (candidates.length > 1) {
     const w = pick(candidates)
     if (sp.removed.has(w.did)) return
-    await attempt(() => sp.authority.client.com.atproto.memberspace.removeMember({ space: sp.uri, did: w.did }))
+    await retried(() => removeMember(sp.authority, sp.uri, w))
     sp.removed.add(w.did)
   }
 }
@@ -326,14 +339,14 @@ async function fire(f, world, env, stats) {
     const old = world.syncers[i]
     await old.idle()
     const snap = f.kind === 'syncer-restart-fresh' ? undefined : (snapshots.get(old.name) ?? old.snapshot())
-    const s = new Syncer(old.name, old.space, old.member, { snapshot: snap })
+    const s = new Syncer(old.name, old.space, old.member, { snapshot: snap, notify: old.register })
     s.svc = old.svc
     s.violations.push(...old.violations)
     for (const k of Object.keys(s.stats)) s.stats[k] += old.stats[k]
     old.notify = () => Promise.resolve() // the dead one hears nothing more
     world.syncers[i] = s
     env.svcs[old.svc].on((call) => {
-      if (call.lxm === 'com.atproto.space.notifyWrite' && call.body.space === s.space) s.notify(call.body)
+      if (call.lxm === 'com.atproto.space.notifySpaceUpdate' && call.body.space === s.space) s.notify(call.body)
     })
     await s.sync()
   }
@@ -363,13 +376,13 @@ async function invariants(world, env, check) {
     const reader = sp.reader
     for (;;) {
       const cred = await credentialFor(reader, sp.uri)
-      const listed = await listReposAll(cred, sp.uri)
+      const listed = await listWritersAll(cred, sp.uri)
       const behind = []
       for (const w of sp.writers) {
         const rp = sp.repos.get(w.did)
         if (sp.removed.has(w.did) || rp.stale || !rp.acked) continue
         const head = await headOf(cred, sp.uri, w.did)
-        const e = listed.find((x) => x.did === w.did)
+        const e = listed.find((x) => x.repo === w.did && x.$type === REPO_WRITE)
         if (e?.repoRev !== head.rev) behind.push(`${w}: listed ${e?.repoRev} head ${head.rev}`)
       }
       if (!behind.length || Date.now() > deadline) {
@@ -385,39 +398,44 @@ async function invariants(world, env, check) {
   for (const s of syncers) {
     const sp = spaces.find((x) => x.uri === s.space)
     const cred = await credentialFor(sp.reader, sp.uri)
-    const listed = await listReposAll(cred, sp.uri)
+    const listed = await listWritersAll(cred, sp.uri)
     if (s.lastError) check(false, `${s.name}: syncing raised`, s.lastError.message)
     const wrong = []
     for (const e of listed) {
-      const local = s.repos.get(e.did)
-      if (!local) {
-        wrong.push(`${e.did} missing`)
+      const local = s.repos.get(e.repo)
+      if (e.$type === REPO_REMOVED) {
+        if (local) wrong.push(`${e.repo} listed as removed, still held`)
         continue
       }
-      const repo = sp.repos.get(e.did)
-      if (!sp.removed.has(e.did) && repo && !repo.stale) {
-        if (local.rev !== e.repoRev) wrong.push(`${e.did} at ${local.rev}, listed ${e.repoRev}`)
-        const d = diff(repo.truth, s.view(e.did))
-        if (d.length) wrong.push(`${e.did}: ${d.slice(0, 3).join(', ')}`)
-        if (!hashEq(local.hash.digest(), e.data)) wrong.push(`${e.did}: LtHash differs from the listed data`)
-      } else if (local.rev < e.repoRev) wrong.push(`${e.did} (removed) behind its listed repoRev`)
+      if (!local) {
+        wrong.push(`${e.repo} missing`)
+        continue
+      }
+      const repo = sp.repos.get(e.repo)
+      if (!sp.removed.has(e.repo) && repo && !repo.stale) {
+        if (local.rev !== e.repoRev) wrong.push(`${e.repo} at ${local.rev}, listed ${e.repoRev}`)
+        const d = diff(repo.truth, s.view(e.repo))
+        if (d.length) wrong.push(`${e.repo}: ${d.slice(0, 3).join(', ')}`)
+        if (!hashEq(local.hash.digest(), e.data)) wrong.push(`${e.repo}: LtHash differs from the listed data`)
+      } else if (local.rev < e.repoRev) wrong.push(`${e.repo} (removed) behind its listed repoRev`)
     }
     check(!wrong.length, `I3 ${s.name} converged on every listed repo`, wrong.slice(0, 5).join('; '))
     check(!s.violations.length, `I5 ${s.name}: no protocol violations`, s.violations.slice(0, 3).join('; '))
   }
-  // I4: spaceRev bookkeeping across every forwarded notify each service received
+  // I4: spaceRev bookkeeping across every update each service received
   for (const [k, svc] of env.svcs.entries()) {
     const bySpace = new Map()
-    for (const c of svc.callsTo('com.atproto.space.notifyWrite')) {
+    for (const c of svc.updates()) {
+      if (!c.body.update?.spaceRev || c.authErr) continue
       if (!bySpace.has(c.body.space)) bySpace.set(c.body.space, [])
-      bySpace.get(c.body.space).push(c.body)
+      bySpace.get(c.body.space).push(c.body.update)
     }
     for (const [space, calls] of bySpace) {
       const assigned = new Map()
       const prevOf = new Map()
       const bad = []
       for (const b of calls) {
-        const key = `${b.repo} ${b.repoRev}`
+        const key = `${b.repo} ${b.repoRev ?? 'removed'}`
         if (assigned.has(b.spaceRev) && assigned.get(b.spaceRev) !== key) bad.push(`spaceRev ${b.spaceRev} given to ${assigned.get(b.spaceRev)} and ${key}`)
         assigned.set(b.spaceRev, key)
         if (b.prevSpaceRev !== undefined) {
@@ -429,7 +447,9 @@ async function invariants(world, env, check) {
       const n = spaces.find((x) => x.uri === space)?.n
       check(!bad.length, `I4 service ${k}, space ${n}: ${calls.length} forwards, one spaceRev per update, no forks`, bad.slice(0, 3).join('; '))
     }
-    check(!svc.authFailures.length, `service ${k}: every forward carried valid service auth`, svc.authFailures.slice(0, 2).map((c) => c.authErr).join('; '))
+    // (a stack reused with KEEP=1 still holds an earlier run's registrations for these ports)
+    const fails = svc.authFailures.filter((c) => spaces.some((sp) => sp.uri === c.body?.space))
+    check(!fails.length, `service ${k}: every call carried its registration's token (or valid service auth)`, fails.slice(0, 2).map((c) => c.authErr).join('; '))
   }
 }
 
@@ -444,18 +464,21 @@ async function listOwn(actor, space) {
   return out
 }
 
-async function listReposAll(cred, space) {
+const REPO_WRITE = 'com.atproto.space.defs#repoWrite'
+const REPO_REMOVED = 'com.atproto.space.defs#repoRemoved'
+
+async function listWritersAll(cred, space) {
   const out = []
   let cursor
   const host = await cred.hostClient()
   for (;;) {
-    const r = await host.com.atproto.space.listRepos({ space, cursor, limit: 100 })
-    if (!r.data.repos.length) break
+    const r = await host.com.atproto.space.listWriters({ space, cursor, limit: 100 })
     for (const e of r.data.repos) {
-      const i = out.findIndex((x) => x.did === e.did)
+      const i = out.findIndex((x) => x.repo === e.repo)
       if (i >= 0) out.splice(i, 1) // a repo can reappear when it moved during paging
       out.push(e)
     }
+    if (!r.data.cursor) break
     cursor = r.data.cursor
   }
   return out
@@ -468,14 +491,14 @@ function diff(want, got) {
   return out
 }
 
-/** Ack -> first forwarded notify for that (space, repo) after it, per service. */
+/** Ack -> first repoWrite update for that (space, repo) after it, per service. */
 function notifyLatencies(world, env, ackTimes) {
   if (!world) return []
   const out = []
   const svc = env.svcs[0]
   const byKey = new Map()
-  for (const c of svc?.callsTo('com.atproto.space.notifyWrite') ?? []) {
-    const k = `${c.body.space} ${c.body.repo}`
+  for (const c of svc?.updates(undefined, 'repoWrite') ?? []) {
+    const k = `${c.body.space} ${c.body.update.repo}`
     if (!byKey.has(k)) byKey.set(k, [])
     byKey.get(k).push(c.at)
   }

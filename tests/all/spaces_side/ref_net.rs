@@ -16,7 +16,7 @@
 //! - [`MockClientApp`]: the reference's `MockClientApp`, publishing client
 //!   metadata and a JWKS over HTTP and signing client attestations.
 
-use crate::common::spaces::{resp, signed_get_as, xrpc_url, Holder, SpaceClient};
+use crate::common::spaces::{put_members, remove_members, resp, signed_get_as, xrpc_url, Holder, SpaceClient};
 use crate::common::*;
 use crate::oauth;
 use base64::Engine;
@@ -30,6 +30,9 @@ use vlpds::space::lthash::LtHash;
 use vlpds::space::token::{self, Mint, TokenType};
 
 pub const TEST_COLLECTION: &str = "com.example.spaceRecord";
+/// The space host's calls to a registered syncer.
+pub const NOTIFY_SPACE_UPDATE: &str = "com.atproto.space.notifySpaceUpdate";
+pub const CONFIRM_REGISTRATION: &str = "com.atproto.space.confirmRegistration";
 pub const TEST_COLLECTION_ALT: &str = "com.example.spaceNote";
 pub const TEST_SPACE_TYPE: &str = "com.example.group";
 pub const OTHER_SPACE_TYPE: &str = "com.example.otherGroup";
@@ -68,6 +71,20 @@ pub fn record(collection: &str, text: &str) -> J {
 }
 
 /// The authority DID of a space URI.
+/// Polls `f` until it holds, or `within` runs out (false).
+pub async fn until(within: Duration, mut f: impl AsyncFnMut() -> bool) -> bool {
+    let end = std::time::Instant::now() + within;
+    loop {
+        if f().await {
+            return true;
+        }
+        if std::time::Instant::now() >= end {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 pub fn authority_of(space: &str) -> &str {
     space.trim_start_matches("at://").split('/').next().unwrap()
 }
@@ -187,7 +204,7 @@ impl Net {
                     }),
                 )
                 .await;
-            assert_eq!(r.ok()["uri"], json!(uri), "createSpace anchors on the caller");
+            assert_eq!(r.ok()["space"], json!(uri), "createSpace anchors on the caller");
         }
         for m in o.members {
             put_member(owner, &uri, m, true, true).await.ok();
@@ -205,6 +222,63 @@ impl Net {
         Cred { credential, holder: r.1, http: actor.srv.http.clone() }
     }
 
+    /// The PDS hosting `did`.
+    pub fn server_of(&self, did: &str) -> &TestServer {
+        &self.pds[*self.hosts.lock().get(did).unwrap_or_else(|| panic!("{did} isn't a Net account"))]
+    }
+
+    /// `getRegistrations(space)`: the registrations the authority holds,
+    /// lapsed ones included.
+    pub async fn registrations(&self, space: &str) -> Vec<vlpds::space::rows::RegistrationRow> {
+        let authority = authority_of(space);
+        let app = &self.server_of(authority).app;
+        vlpds::space::host::registrations(app, authority, &vlpds::state::space_id(space)).await.unwrap()
+    }
+
+    /// `lapseRegistration(space, syncer, ago)`: the registration of `svc`'s
+    /// endpoint with `token` expired `ago` ago, through the authority's
+    /// worker.
+    pub async fn lapse(&self, space: &str, svc: &MockService, token: &str, ago: Duration) {
+        let app = &self.server_of(authority_of(space)).app;
+        let at = vlatproto::tid::now_micros() - ago.as_micros() as u64;
+        vlpds::xrpc::space::set_registration_expiry(app, space, &svc.url, token, at).await.unwrap();
+    }
+
+    /// The syncer notices waiting for a retry (`sY`) at the space's
+    /// authority, as JSON.
+    pub async fn pending_notices(&self, space: &str) -> Vec<J> {
+        use vlpds::state;
+        let authority = authority_of(space);
+        let p = self.server_of(authority).app.partitions.for_key(authority).expect("the authority's shard");
+        let prefix = state::space_prefix(state::SPACE_NOTICE_FAMILY, authority, &state::space_id(space));
+        let mut it = p.db.scan(prefix.clone()..vlsync_store::keys::prefix_end(&prefix)).await.unwrap();
+        let mut out = Vec::new();
+        while let Some(kv) = it.next().await.unwrap() {
+            out.push(serde_json::from_slice(&kv.value).unwrap());
+        }
+        out
+    }
+
+    /// One retry pass of the syncer notices at the space's authority, as
+    /// though `ahead` had passed.
+    pub async fn retry_notices(&self, space: &str, ahead: Duration) -> usize {
+        let app = &self.server_of(authority_of(space)).app;
+        let now = vlatproto::tid::now_micros() + ahead.as_micros() as u64;
+        vlpds::space::notices::retry_due(app, now).await.unwrap()
+    }
+
+    /// `sc.authorize(space, {notify})`: authorizeSpaceSync at the space's
+    /// authority with a fresh delegation token from `actor`, carrying
+    /// `notify`; the response.
+    pub async fn register(&self, actor: &SpaceClient, space: &str, notify: J) -> Resp {
+        let token = delegation_token(actor, space).await;
+        let holder = Holder::new();
+        let host = self.host_of(authority_of(space));
+        let body = json!({"space": space, "credentialKey": holder.did, "delegationToken": token, "notify": notify});
+        let rb = reqwest::Client::new().post(format!("{host}/xrpc/com.atproto.space.authorizeSpaceSync"));
+        resp(rb.json(&body).send().await.unwrap()).await
+    }
+
     /// `sc.mintCredential(space, token, {clientAttestation})` at the
     /// authority's PDS: the response and the holder key that signed it.
     pub async fn mint_credential(&self, space: &str, token: &str, attestation: Option<&str>) -> (Resp, Holder) {
@@ -213,23 +287,23 @@ impl Net {
         (exchange(&reqwest::Client::new(), &holder, &host, space, token, attestation).await, holder)
     }
 
-    /// `sc.publicCredential(space, {clientAttestation})`: getSpaceCredential
+    /// `sc.publicCredential(space, {clientAttestation})`: authorizeSpaceSync
     /// at the authority with no delegation token.
     pub async fn public_credential(&self, space: &str, attestation: Option<&str>) -> (Resp, Holder) {
         let holder = Holder::new();
         let host = self.host_of(authority_of(space));
-        let mut body = json!({"space": space, "credentialKid": holder.did});
+        let mut body = json!({"space": space, "credentialKey": holder.did});
         if let Some(a) = attestation {
             body["clientAttestation"] = json!(a);
         }
-        let rb = reqwest::Client::new().post(format!("{host}/xrpc/com.atproto.space.getSpaceCredential"));
+        let rb = reqwest::Client::new().post(format!("{host}/xrpc/com.atproto.space.authorizeSpaceSync"));
         (resp(rb.json(&body).send().await.unwrap()).await, holder)
     }
 
-    /// The authority's writer set as its storage holds it (`sW`), as the
-    /// reference's `writerDids` reads it: no credential, so an allowedApps
-    /// space's app perimeter doesn't stand in the way. `owner` is the
-    /// authority's account.
+    /// The authority's writer set as its storage holds it (`sW`, leaving
+    /// out removed writers), as the reference's `writerDids` reads it: no
+    /// credential, so an allowedApps space's app perimeter doesn't stand
+    /// in the way. `owner` is the authority's account.
     pub async fn writer_dids(&self, owner: &SpaceClient, space: &str) -> Vec<String> {
         use vlpds::state;
         let i = *self.hosts.lock().get(&owner.did).expect("a Net account");
@@ -238,7 +312,9 @@ impl Net {
         let mut it = p.db.scan(prefix.clone()..vlsync_store::keys::prefix_end(&prefix)).await.unwrap();
         let mut dids = Vec::new();
         while let Some(kv) = it.next().await.unwrap() {
-            dids.push(String::from_utf8_lossy(&kv.key[prefix.len()..]).into_owned());
+            if !vlpds::space::rows::WriterRow::decode(&kv.value).unwrap().removed {
+                dids.push(String::from_utf8_lossy(&kv.key[prefix.len()..]).into_owned());
+            }
         }
         dids.sort();
         dids
@@ -273,14 +349,16 @@ pub struct SpaceOpts<'a> {
 pub async fn put_member(owner: &SpaceClient, space: &str, member: &SpaceClient, read: bool, write: bool) -> Resp {
     owner
         .post(
-            "com.atproto.memberspace.putMember",
-            json!({"space": space, "did": member.did, "read": read, "write": write}),
+            "com.atproto.memberspace.putMembers",
+            put_members(json!({"space": space, "did": member.did, "read": read, "write": write})),
         )
         .await
 }
 
 pub async fn remove_member(owner: &SpaceClient, space: &str, member: &SpaceClient) -> Resp {
-    owner.post("com.atproto.memberspace.removeMember", json!({"space": space, "did": member.did})).await
+    owner
+        .post("com.atproto.memberspace.removeMembers", remove_members(json!({"space": space, "did": member.did})))
+        .await
 }
 
 /// `sc.clear`: clearRecords of the actor's own repo.
@@ -290,14 +368,14 @@ pub async fn clear(actor: &SpaceClient, space: &str) -> Resp {
 
 /// `sc.removeWriter`.
 pub async fn remove_writer(owner: &SpaceClient, space: &str, writer: &SpaceClient) -> Resp {
-    owner.post("com.atproto.space.removeWriter", json!({"space": space, "did": writer.did})).await
+    owner.post("com.atproto.space.removeWriter", json!({"space": space, "repo": writer.did})).await
 }
 
 pub async fn delegation_token(actor: &SpaceClient, space: &str) -> String {
     actor.delegation_token(space).await.ok()["token"].as_str().unwrap().to_string()
 }
 
-/// getSpaceCredential at `host`, signed by `holder` for `token`.
+/// authorizeSpaceSync at `host`, signed by `holder` for `token`.
 pub async fn exchange(
     http: &reqwest::Client,
     holder: &Holder,
@@ -306,11 +384,11 @@ pub async fn exchange(
     token: &str,
     attestation: Option<&str>,
 ) -> Resp {
-    let mut body = json!({"space": space, "credentialKid": holder.did, "delegationToken": token});
+    let mut body = json!({"space": space, "credentialKey": holder.did, "delegationToken": token});
     if let Some(a) = attestation {
         body["clientAttestation"] = json!(a);
     }
-    let rb = http.post(format!("{host}/xrpc/com.atproto.space.getSpaceCredential"));
+    let rb = http.post(format!("{host}/xrpc/com.atproto.space.authorizeSpaceSync"));
     resp(rb.json(&body).send().await.unwrap()).await
 }
 
@@ -546,15 +624,6 @@ impl Cred {
         signed_get_as(&self.http, &self.holder, base, nsid, query, &self.credential, aud).await
     }
 
-    pub async fn post(&self, base: &str, nsid: &str, body: J) -> Resp {
-        let aud = body["repo"].as_str().unwrap_or_else(|| authority_of(body["space"].as_str().unwrap())).to_string();
-        let mut rb = self.http.post(format!("{base}/xrpc/{nsid}"));
-        for (k, v) in self.holder.credential_headers(&self.credential, &aud) {
-            rb = rb.header(k, v);
-        }
-        resp(rb.json(&body).send().await.unwrap()).await
-    }
-
     /// The signed headers for `aud` (`createSpaceSigHeaders`).
     pub fn headers(&self, aud: &str) -> Vec<(String, String)> {
         self.holder.credential_headers(&self.credential, aud)
@@ -600,12 +669,17 @@ pub struct Call {
 
 /// A did:web on loopback whose document names an `#atproto` key and the
 /// given services, all pointing at itself. Records every XRPC call and
-/// answers with [`MockService::respond`]'s status and body.
+/// answers with [`MockService::respond`]'s status and body, except
+/// confirmRegistration, which it confirms (echoing the challenge) unless
+/// told not to.
 pub struct MockService {
     pub did: String,
     pub url: String,
     pub service_id: String,
     pub key: Arc<vlatproto::crypto::Keypair>,
+    /// The token it registers with ([`Self::notify`]).
+    pub token: String,
+    confirm: Arc<AtomicBool>,
     calls: Arc<Mutex<Vec<Call>>>,
     respond: Arc<Mutex<(u16, J)>>,
     /// Answers used once each, ahead of `respond`.
@@ -643,9 +717,12 @@ impl MockService {
         let doc_ok = Arc::new(AtomicBool::new(true));
         let gate = Arc::new(tokio::sync::Mutex::new(()));
         let queued: Arc<Mutex<std::collections::VecDeque<(u16, J)>>> = Default::default();
+        let confirm = Arc::new(AtomicBool::new(true));
         let (c, r, d, g, q) = (calls.clone(), respond.clone(), doc_ok.clone(), gate.clone(), queued.clone());
+        let cf = confirm.clone();
         let router = axum::Router::new().fallback(move |req: axum::extract::Request| {
             let (c, r, d, g, q, doc) = (c.clone(), r.clone(), d.clone(), g.clone(), q.clone(), doc.clone());
+            let cf = cf.clone();
             async move {
                 let path = req.uri().path().to_string();
                 if path == "/.well-known/did.json" {
@@ -670,7 +747,12 @@ impl MockService {
                         serde_json::from_slice(&raw).unwrap_or_else(|_| J::String(String::from_utf8_lossy(&raw).into()))
                     }
                 };
+                let confirming = lxm == "com.atproto.space.confirmRegistration" && cf.load(Ordering::SeqCst);
+                let echo = crate::common::spaces::confirmed(&body);
                 c.lock().push(Call { lxm, body, auth });
+                if confirming {
+                    return axum::Json(echo).into_response();
+                }
                 drop(g.lock().await);
                 let next = q.lock().pop_front();
                 let (status, body) = next.unwrap_or_else(|| r.lock().clone());
@@ -683,6 +765,8 @@ impl MockService {
             url,
             service_id: services.first().map(|s| s.0.to_string()).unwrap_or_default(),
             key,
+            token: format!("tok-{}", token::new_jti()),
+            confirm,
             calls,
             respond,
             queued,
@@ -704,6 +788,27 @@ impl MockService {
     /// `did#serviceId`, the form a notify target or managing app is named by.
     pub fn service_ref(&self) -> String {
         format!("{}#{}", self.did, self.service_id)
+    }
+
+    /// authorizeSpaceSync's `notify` for this service: its URL and token.
+    pub fn notify(&self) -> J {
+        crate::common::spaces::notify(&self.url, &self.token)
+    }
+
+    /// `syncer.notifyRegistration(token)`.
+    pub fn notify_with(&self, token: &str) -> J {
+        crate::common::spaces::notify(&self.url, token)
+    }
+
+    /// Confirm registrations (`true`, the default), or answer them as any
+    /// other call.
+    pub fn confirm_registrations(&self, yes: bool) {
+        self.confirm.store(yes, Ordering::SeqCst);
+    }
+
+    /// The `update`s of the notifySpaceUpdate calls it got.
+    pub fn updates(&self) -> Vec<J> {
+        self.calls_to(NOTIFY_SPACE_UPDATE).into_iter().map(|c| c.body["update"].clone()).collect()
     }
 
     pub fn respond(&self, status: u16, body: J) {

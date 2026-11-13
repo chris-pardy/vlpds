@@ -6,9 +6,13 @@ under a 16 GB memory cap. Every target is met and nothing needed fixing.
 
 These numbers are from the October 1 Spaces wire. Since the November 5 one, a credential
 read of a commit or record (getLatestCommit, getRepo, listRepoOps, getRecord) derives a
-per-request secret by ECDH against the account's `#atproto_kem` key and answers an HMAC
-instead of a commit signature, getRepo is a STAR archive, and members are managed with
-`com.atproto.memberspace.putMember`. Re-measure before comparing against them.
+per-request secret against the account's `#atproto_kem` key and answers an HMAC instead of a
+commit signature, getRepo is a STAR archive, and members are managed with the memberspace
+methods. Since the November 12 one, that secret comes from HPKE secret export, the MAC is an
+RFC 9421 signature requested with `Accept-Signature` (and every `listRepoOps` page carries
+the commit and its MAC, at-head polls included), members change with `putMembers` /
+`removeMembers`, and syncers register through `authorizeSpaceSync`'s `notify` and get
+`notifySpaceUpdate`. Re-measure before comparing against them.
 
 ## How to run
 
@@ -40,8 +44,9 @@ Knobs (env):
 | `SPACES_BENCH_POLL_MS` / `_WRITE_MS` | 1000 / 500 | poll interval, space write interval per writer |
 | `SPACES_BENCH_PUBLIC` | 16 | public writers posting back to back |
 
-Members (`_M` > 0) need simplespace `putMember` (C3), and syncers need
-`registerNotify` and fan-out (C3, C4). With only C1 in, run with
+Members (`_M` > 0) need the member methods (C3, `putMember` then, `putMembers` now), and
+syncers need notify registrations and fan-out (C3, C4; `registerNotify` then, `authorizeSpaceSync`'s
+`notify` now). With only C1 in, run with
 `SPACES_BENCH_M=0 SPACES_BENCH_SYNCERS=0`.
 
 ## What each number means

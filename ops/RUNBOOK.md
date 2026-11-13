@@ -1717,7 +1717,7 @@ Limits & lockouts page).
 
 ### VlpdsSpaceOutboxBacklog
 
-**Means:** a node has owed some space authority a `notifyWrite` for over an
+**Means:** a node has owed some space authority a `notifyRepoUpdate` for over an
 hour (`vlpds_space_outbox_oldest_seconds`). Every space write is durable and
 readable at its 200. The outbox only tells the authority that the repo moved,
 so syncers find the write later than they should. Each (repo, space) has one
@@ -1727,12 +1727,12 @@ or found when its shard opened). The row's `sP` key survives a
 restart or a takeover, and the next owner sends it again.
 
 **Causes:** the authority's PDS is down or answering 5xx, its DID doesn't
-resolve to an `#atproto_space_host` or `#atproto_pds` endpoint. A deactivated
+resolve to an `#atproto_pds` endpoint. A deactivated
 or taken-down writer's rows wait for a restore. They're left out of the age,
 so they never fire this alert.
 
-**Confirm:** the internals dashboard's Spaces row: `notifyWrite by hop and
-result` shows `out retry` (the authority is failing). The node logs `space notifyWrite retry: <why>` with the DID, space
+**Confirm:** the internals dashboard's Spaces row: `Space notifies by hop and
+result` shows `out retry` (the authority is failing). The node logs `space notifyRepoUpdate retry: <why>` with the DID, space
 and rev on every failed send.
 
 **Do:**
@@ -1740,7 +1740,7 @@ and rev on every failed send.
   Once it does, the next retry (at most ~1 h away) delivers the newest rev.
 - Many authorities failing at once: look at this node's outbound path (DNS,
   egress, `http::guarded` refusals in the logs).
-- A row past 24 h is dropped. The authority's `listRepos` then lags for that
+- A row past 24 h is dropped. The authority's `listWriters` then lags for that
   repo until its next write. Syncers still catch up from `listRepoOps`.
 
 ### VlpdsSpaceDigestMismatch
@@ -1768,12 +1768,14 @@ the records.
 
 ### VlpdsSpaceNotifyFanoutFailing
 
-**Means:** over half of the notifies this node forwards to registered syncers
-fail, at over 0.1/s, for 30 min
-(`vlpds_space_notify_total{hop="fanout"}`). Syncers register with
-`registerNotify` and are third-party services. A failed fan-out only delays a
-syncer, since it pulls from its last rev on the next notify or poll and
-`listRepos` covers gaps. Fan-out runs off the write path, so writes aren't
+**Means:** over half of the `notifySpaceUpdate` updates this node forwards to
+registered syncers fail, at over 0.1/s, for 30 min
+(`vlpds_space_notify_total{hop="fanout"}`). Syncers register through
+`authorizeSpaceSync`'s `notify` and are third-party services. A failed fan-out
+only delays a syncer, since it pulls from its last rev on the next update or
+poll and `listWriters` covers gaps. Deletion and expiry notices count as
+`hop="notice"` and are retried for 72 h on their own (`sY` rows), so they
+don't feed this alert. Fan-out runs off the write path, so writes aren't
 slowed by it.
 
 **Causes:** one big syncer down or refusing (the usual case on a small node),
@@ -1781,12 +1783,16 @@ or this node's egress failing.
 
 **Confirm:** the Spaces row's `Fan-out queue depth and drops` and the failure
 ratio by hop. `out` failing at the same time points at egress. The logs name
-the syncer's service id (`space notify forward failed` or `refused`, with
-`service` and `status`) per failure.
+the registration (`space notify forward failed` or `refused`, with `reg`, the
+registration id the console lists, and `status`) per failure.
 
 **Do:**
-- One syncer down: nothing to do. Its registrations expire 24 h after their
-  last `registerNotify` and are pruned once they keep failing past that.
+- One syncer down: nothing to do. Its registrations lapse when the
+  credential from their last authorization expires (an hour at most). A
+  lapsed one gets a `registrationExpired` notice in place of its next update,
+  then nothing, and is unregistered if the syncer rejects that notice or
+  can't be reached for 72 h. To stop one sooner, remove it on the space's
+  console page.
 - Egress: same as any outbound trouble (DNS, firewall, `http::guarded`
   refusals in the logs).
 
@@ -1825,7 +1831,7 @@ its space. Over 100 blocked spaces of one authority become one block of the
 authority, and over 1,000 blocked authorities, every remote one is refused.
 Blocks never fail open, so this is what's left when they're full.
 
-**Causes:** someone flooding `notifyCredentialRevoked` from many authorities
+**Causes:** someone flooding `notifyCredentialsRevoked` from many authorities
 with stakes here (accounts here holding repos in their spaces), or caps far
 too low for real traffic.
 

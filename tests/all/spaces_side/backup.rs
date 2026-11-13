@@ -29,7 +29,7 @@ pub(super) async fn space_backup(sc: &SpaceClient) -> BTreeMap<String, Vec<u8>> 
         }
         let r = sc.get("com.atproto.space.listSpaces", &q).await.ok();
         let page = r["spaces"].as_array().cloned().unwrap_or_default();
-        spaces.extend(page.iter().map(|s| s["uri"].as_str().unwrap().to_string()));
+        spaces.extend(page.iter().map(|s| s["space"].as_str().unwrap().to_string()));
         cursor = r["cursor"].as_str().map(String::from);
         if page.is_empty() || cursor.is_none() {
             break;

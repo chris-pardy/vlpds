@@ -54,13 +54,13 @@ signs in (adding or removing a passkey, turning TOTP off, new recovery codes) do
 
 With `--spaces` on there are nine more. The reference only limits space writes, and those share the
 repo-write buckets here too. Space reads get a budget per credential and per account
-(`space-read-*`), counted on the repo's owner. Each `getSpaceCredential` claims its delegation
+(`space-read-*`), counted on the repo's owner. Each `authorizeSpaceSync` claims its delegation
 token durably, so it's capped per account and authority (`space-credential`). An inbound
-`notifyWrite` is a durable entry on the authority's owner and a revocation is a write to a
+`notifyRepoUpdate` is a durable entry on the authority's owner and a revocation is a write to a
 cluster-wide object, so they're capped per writer, per authority and per account here
-(`space-notify-in`, `space-revoke`, `space-revoke-aud`). Each space an account makes, and each
-registration a credential makes, is fanned out to on every write, so they're capped too
-(`space-create`, `space-register`). `space.importRepo` is capped per account before its body is read
+(`space-notify-in`, `space-revoke`, `space-revoke-aud`). Each space an account makes is fanned out
+to on every write, and each new notify registration costs a `confirmRegistration` call to an
+endpoint the caller chose, so they're capped too (`space-create`, `space-register`). `space.importRepo` is capped per account before its body is read
 (`space-import`).
 
 ## The buckets
@@ -110,15 +110,15 @@ the start of the next. The names are what the console, the config and the metric
 | `passkey-register-account` | DID | 1 day | 10 | `vlpds.server.startPasskeyRegistration`, so passkeys added to one account (each rewrites its passkeys row and mails the owner) | 429 · the Security page shows an error |
 | `federated-link-account` | DID | 1 day | 10 | adding or removing a third-party sign-in on `/oauth/account`, so identities linked to one account (each mails the owner) | 429 · the page shows an error |
 | `passkey-sign-in-ip` | IP | 5 min | 100 | the account page's passkey sign-in (`vlpds.server.startPasskeySignIn`, `vlpds.server.createPasskeySession`) · OAuth page passkey posts count against `oauth-sign-in-ip` instead | 429 · the account page shows an error |
-| `space-read-credential` | space credential | 5 min | 3,000 | `com.atproto.space` reads and the space host's `listRepos`, `registerNotify` and `unregisterNotify` made with one space credential (keyed by a hash of its issuer and `jti`, so the console doesn't show them) · with `--spaces` | 429 |
+| `space-read-credential` | space credential | 5 min | 3,000 | `com.atproto.space` reads and the space host's `listWriters` made with one space credential (keyed by a hash of its issuer and `jti`, so the console doesn't show them) · with `--spaces` | 429 |
 | `space-read-account` | DID | 5 min | 3,000 | `com.atproto.space` reads, `listSpaces`, `getSpace` and `memberspace.listMembers` by an account's own OAuth session · with `--spaces` | 429 |
-| `space-credential` | DID + authority | 1 h | 300 | `space.getSpaceCredential` per account and space authority, counted on the authority's owner before the delegation token is claimed, keyed by a hash of the pair so the console doesn't show them · with `--spaces` | 429 · the token stays unused |
-| `space-notify-in` | DID | 5 min | 1,000 | `space.notifyWrite` arriving from another host, per writer (each is a durable entry) · with `--spaces` | 429 · the writer's outbox retries |
-| `space-revoke` | DID | 1 h | 1000 | Credentials newly revoked by `space.notifyCredentialRevoked`, per space authority (one point per jti not already revoked, each a write to the cluster-wide revocations object · a call naming only revoked ones costs nothing) · with `--spaces` | 429 |
+| `space-credential` | DID + authority | 1 h | 300 | `space.authorizeSpaceSync` per account and space authority, counted on the authority's owner before the delegation token is claimed, keyed by a hash of the pair so the console doesn't show them · with `--spaces` | 429 · the token stays unused |
+| `space-notify-in` | DID | 5 min | 1,000 | `space.notifyRepoUpdate` (or its Nov 5 name, `notifyWrite`) arriving from another host, per writer (each is a durable entry) · with `--spaces` | 429 · the writer's outbox retries |
+| `space-revoke` | DID | 1 h | 1000 | Credentials newly revoked by `space.notifyCredentialsRevoked`, per space authority (one point per jti not already revoked, each a write to the cluster-wide revocations object · a call naming only revoked ones costs nothing) · with `--spaces` | 429 |
 | `space-import` | DID | 1 h | 100 | `space.importRepo` per account, spent before the body is read (an account also runs 2 at once and a node up to 8, as its import budget allows: `InvalidRequest` and 503 `Overloaded` past those) · with `--spaces` | 429 |
-| `space-revoke-aud` | DID | 1 h | 2,000 | Credentials newly revoked by `space.notifyCredentialRevoked`, per account here whose stake let them in (only those are stored), so one account and many authorities can't fill the revocations object · with `--spaces` | 429 · the space's credentials are refused for 3,610 s (a revocation not stored never fails open) |
+| `space-revoke-aud` | DID | 1 h | 2,000 | Credentials newly revoked by `space.notifyCredentialsRevoked`, per account here whose stake let them in (only those are stored), so one account and many authorities can't fill the revocations object · with `--spaces` | 429 · the space's credentials are refused for 3,610 s (a revocation not stored never fails open) |
 | `space-create` | DID | 1 day | 100 | `space.createSpace` per account, for a space that isn't live yet (an account also governs at most 1,000 live spaces) · with `--spaces` | 429 |
-| `space-register` | space credential | 1 h | 60 | `space.registerNotify` with one space credential (keyed by a hash of its issuer and `jti`) · with `--spaces` | 429 |
+| `space-register` | space credential | 1 h | 60 | new notify registrations from `space.authorizeSpaceSync` (each a `confirmRegistration` call). Despite the key kind, it's counted per space and endpoint host, not per credential, keyed by a hash of the pair so the console doesn't show them; a renewal costs nothing · with `--spaces` | 429 · the authorization fails |
 
 `npm run check-docs` fails if this table's key, window or points disagree with `src/ratelimit.rs`.
 

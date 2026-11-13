@@ -7,7 +7,7 @@
 //! read vs read_self, the consent screen's names and warning, and the
 //! Spaces rate-limit buckets.
 
-use crate::common::spaces::{resp, SpaceClient};
+use crate::common::spaces::{put_members, resp, SpaceClient};
 use crate::common::*;
 use crate::oauth::{self, Browser, DpopKey, Flow, Srv};
 
@@ -458,16 +458,16 @@ async fn list_spaces_wildcard() {
     let a = SpaceClient::new(&s, "c6ls", &format!("space:{ty}?action=read_self&manage=create")).await;
     let space = a.create_space(ty, "main").await;
     // `self` resolved: a filter naming the account is covered, any authority isn't
-    a.get("com.atproto.space.listSpaces", &[("spaceType", ty), ("did", &a.did)]).await.ok();
+    a.get("com.atproto.space.listSpaces", &[("spaceType", ty), ("spaceDid", &a.did)]).await.ok();
     a.get("com.atproto.space.listSpaces", &[("spaceType", ty)]).await.err(403, "ScopeMissingError");
     a.get("com.atproto.space.listSpaces", &[]).await.err(403, "ScopeMissingError");
     let w = regrant(&a, "space:*?authority=*&action=read_self").await;
     let all = w.get("com.atproto.space.listSpaces", &[]).await.ok();
-    assert_eq!(all["spaces"][0]["uri"], space.as_str());
+    assert_eq!(all["spaces"][0]["space"], space.as_str());
     w.get("com.atproto.space.listSpaces", &[("spaceType", ty)]).await.ok();
     // a wildcard type at one authority covers that authority only
     let one = regrant(&a, &format!("space:*?authority={}&action=read_self", a.did)).await;
-    one.get("com.atproto.space.listSpaces", &[("did", &a.did)]).await.ok();
+    one.get("com.atproto.space.listSpaces", &[("spaceDid", &a.did)]).await.ok();
     one.get("com.atproto.space.listSpaces", &[]).await.err(403, "ScopeMissingError");
 }
 
@@ -606,7 +606,7 @@ async fn bearer_post(s: &TestServer, nsid: &str, jwt: &str, body: J) -> Resp {
 }
 
 /// Each Spaces bucket answers 429 once its points are spent: reads per
-/// credential and per account, getSpaceCredential per (account,
+/// credential and per account, authorizeSpaceSync per (account,
 /// authority), inbound notifyWrite per writer, revocations per authority.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn space_rate_buckets_trip() {
@@ -623,9 +623,12 @@ async fn space_rate_buckets_trip() {
     let b = SpaceClient::new(&s, "c6rlb", &full).await;
     let space = a.create_space(ty, "main").await;
     a.create_record(&space, coll, Some("x"), rec(coll)).await.ok();
-    a.post("com.atproto.memberspace.putMember", json!({"space": space, "did": b.did, "read": true, "write": true}))
-        .await
-        .ok();
+    a.post(
+        "com.atproto.memberspace.putMembers",
+        put_members(json!({"space": space, "did": b.did, "read": true, "write": true})),
+    )
+    .await
+    .ok();
     set_limits(
         &s,
         json!({
@@ -669,15 +672,15 @@ async fn space_rate_buckets_trip() {
 
     // space-notify-in: per writer (b's notifyWrite reaching its authority)
     let notify = json!({"space": space, "repo": b.did, "repoRev": "3l2cqzy5yf22a", "data": {"$bytes": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}});
-    let jwt = service_jwt(&s, &b.did, &a.did, "com.atproto.space.notifyWrite").await;
-    let first = bearer_post(&s, "com.atproto.space.notifyWrite", &jwt, notify.clone()).await;
+    let jwt = service_jwt(&s, &b.did, &a.did, "com.atproto.space.notifyRepoUpdate").await;
+    let first = bearer_post(&s, "com.atproto.space.notifyRepoUpdate", &jwt, notify.clone()).await;
     assert_ne!(first.status, 429, "{first:?}");
-    let jwt = service_jwt(&s, &b.did, &a.did, "com.atproto.space.notifyWrite").await;
-    tripped(&bearer_post(&s, "com.atproto.space.notifyWrite", &jwt, notify).await, 1);
+    let jwt = service_jwt(&s, &b.did, &a.did, "com.atproto.space.notifyRepoUpdate").await;
+    tripped(&bearer_post(&s, "com.atproto.space.notifyRepoUpdate", &jwt, notify).await, 1);
 
     // space-revoke: per authority
     let revoke = |jti: &str| json!({"space": space, "credentials": [jti]});
-    let lxm = "com.atproto.space.notifyCredentialRevoked";
+    let lxm = "com.atproto.space.notifyCredentialsRevoked";
     let jwt = service_jwt(&s, &a.did, &b.did, lxm).await;
     bearer_post(&s, lxm, &jwt, revoke("3l2cqzy5yf22b")).await.ok();
     let jwt = service_jwt(&s, &a.did, &b.did, lxm).await;

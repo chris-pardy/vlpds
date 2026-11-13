@@ -572,9 +572,9 @@ pub async fn verify_service_jwt(app: &App, token: &str, lxm: Option<&str>) -> XR
 }
 
 /// Service auth for the space methods whose audience depends on the
-/// request (reference `serviceAuth`, `audience: null`): notifyWrite to a
+/// request (reference `serviceAuth`, `audience: null`): notifyRepoUpdate to a
 /// space host (`{authority}#atproto_pds` or the bare authority DID)
-/// and notifyCredentialRevoked to a repo host (a local account's DID).
+/// and notifyCredentialsRevoked to a repo host (a local account's DID).
 /// `lxm` must be the method. The handler checks `aud`, as the reference's
 /// do (403).
 pub async fn verify_space_service_jwt(app: &App, headers: &HeaderMap, lxm: &str) -> XResult<ServiceAuth> {
@@ -878,7 +878,7 @@ pub struct Delegation {
     pub authority: String,
 }
 
-/// Reference `verifyDelegationToken`, for getSpaceCredential's body: a
+/// Reference `verifyDelegationToken`, for authorizeSpaceSync's body: a
 /// delegation token addressed to its space's authority, its `jti` claimed
 /// once (at the authority's owner, durably, so a failover doesn't reopen
 /// it). It isn't the request's authorization, so a bad one is

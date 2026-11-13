@@ -56,8 +56,9 @@ fn working_set(declared: Option<u64>) -> u64 {
     FIXED + 3 * record + 2 * batch + (KEEP_IN_MEMORY as u64).min(body)
 }
 
+/// A malformed or unverifiable archive (reference `throwInvalidArchive`).
 fn invalid(m: impl Into<String>) -> XrpcError {
-    XrpcError::bad("InvalidRequest", m)
+    XrpcError::bad("InvalidRepoFile", m)
 }
 
 /// A STAR archive read item by item as the body arrives.
@@ -268,7 +269,10 @@ async fn import(app: &Arc<App>, creds: &Credentials, headers: &HeaderMap, body: 
     // ones let in never wait on each other for room
     let node_cap = app.imports.holds(working_set(None)) as usize;
     let _slot = sp.import_slot(&did, node_cap).map_err(|account| match account {
-        true => invalid("too many space imports in progress for this account; retry once one is done"),
+        true => XrpcError::bad(
+            "InvalidRequest",
+            "too many space imports in progress for this account; retry once one is done",
+        ),
         false => XrpcError::unavailable("Overloaded", "too many space imports in progress; retry shortly"),
     })?;
     let _room = app.imports.admit_working_set(working_set(declared)).await?;
@@ -280,7 +284,7 @@ async fn import(app: &Arc<App>, creds: &Credentials, headers: &HeaderMap, body: 
     };
     let c = star::parse_repo_meta(&meta).map_err(|e| invalid(format!("Invalid STAR: {e}")))?;
     if c.repo != did {
-        return Err(invalid("Repo does not match the authenticated account"));
+        return Err(XrpcError::bad("RepoMismatch", "Repo does not match the authenticated account"));
     }
     let space = Space::parse(&c.space)?;
     creds.need_space(&space.target(), SpaceAccess::WriteAny("create"))?;
@@ -367,7 +371,10 @@ async fn stage(
         }
         records += 1;
         if records > max_records {
-            return Err(invalid(format!("Space repo record limit reached: at most {max_records} records")));
+            return Err(XrpcError::bad(
+                "InvalidRequest",
+                format!("Space repo record limit reached: at most {max_records} records"),
+            ));
         }
         let blobs = record_blobs(path, &value)?;
         let cid = Cid::dag_cbor(&value);

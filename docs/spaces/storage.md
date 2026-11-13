@@ -13,7 +13,7 @@ diagram:
     - { id: api, label: Apps · syncers, sub: "space.* · memberspace.*", at: [0, 5.5], size: [9, 3], tone: ink }
     - { id: fwd, label: Any node, sub: routes the call, at: [12, 5.5], size: [9, 3], tone: accent }
     - { id: as, label: Author's shard, sub: "sH · sR · sO · sP · sb · sc · sL", at: [25, 1], size: [11, 3], tone: accent }
-    - { id: hs, label: Authority's shard, sub: "sS · sM · sW · sQ · sN · sD · sL", at: [25, 10], size: [11, 3], tone: accent }
+    - { id: hs, label: Authority's shard, sub: "sS · sM · sW · sQ · sG · sY · sL", at: [25, 10], size: [11, 3], tone: accent }
     - { id: fh, label: Firehose, sub: "merger · peers · backfill", at: [40, 0], size: [11, 2.6], tone: blue }
     - { id: log, label: "`log/` segments", sub: "private entries", at: [40, 5.2], size: [11, 3.2], shape: store, tone: amber }
   edges:
@@ -46,13 +46,13 @@ hash collision fails loudly with `space id collision` instead of mixing two spac
 | `sH/{did}\0{sid}` | the author | the space repo head: URI, rev, LtHash state, record count, created |
 | `sR/{did}\0{sid}{coll}/{rkey}` | the author | CID, rev and record bytes, as `R/` holds them. The source of truth |
 | `sO/{did}\0{sid}{rev}{idx}` | the author | the oplog: action, collection, rkey, CID and prev CID. Kept 7 days |
-| `sP/{did}\0{sid}` | the author | the notifyWrite outbox: URI, repoRev and data hash, one row per (repo, space) |
+| `sP/{did}\0{sid}` | the author | the notifyRepoUpdate outbox: URI, repoRev and data hash, one row per (repo, space) |
 | `sS/{auth}\0{sid}` | the authority | the space as JSON: URI, the policy (as on the wire, defaults filled in), created, and `deleted` for a tombstone. It also carries the closest `readPolicy`/`writePolicy`/`appAccess`, which an older build reads. A row from before space policies holds only those and decodes to the policy the reference's migration gives it |
 | `sM/{auth}\0{sid}{member}` | the authority | a member's read and write access. Read only under a `memberspace`, and wiped when the space changes policy |
-| `sW/{auth}\0{sid}{writer}` | the authority | writer state: repoRev, data hash, spaceRev |
-| `sQ/{auth}\0{sid}{spaceRev}` | the authority | the writer's DID, in `listRepos` order, and the spaceRev sequenced just before it. It holds each writer's latest state only, so the row before isn't always that one |
-| `sN/{auth}\0{sid}{service}` | the authority | a notify registration: endpoint and expiry (24 h) |
-| `sD/{auth}\0{sid}{service}` | the authority | a `notifySpaceDeleted` still owed to a registered service: the space URI, endpoint, expiry, attempt count and next try |
+| `sW/{auth}\0{sid}{writer}` | the authority | writer state: repoRev, data hash, spaceRev, and whether it was removed. A removed writer's row is kept and marked (49 bytes) at the spaceRev of its removal; a row from before the Nov 12 alpha reads as not removed |
+| `sQ/{auth}\0{sid}{spaceRev}` | the authority | the writer's DID, in `listWriters` order, and the spaceRev sequenced just before it. It holds each writer's latest state only, so the row before isn't always that one |
+| `sG/{auth}\0{sid}{reg id}` | the authority | a notify registration: endpoint, token, expiry (the `exp` of the credential from its latest authorization) and whether its expiry notice was claimed. `{reg id}` is the first 16 bytes of sha256(endpoint ‖ `\0` ‖ token) |
+| `sY/{auth}\0{sid}{reg id}` | the authority | a `spaceDeleted` or `registrationExpired` notice still owed to a registration: the space URI, endpoint, token, attempt count, next try and the end of its 72 h window |
 | `sb/{did}\0{sid}{cid}\0{path}` | the author | a space record's blob ref, at the rev that wrote it. `space.listBlobs` scans it in CID order |
 | `sc/{did}\0{cid}\0{sid}{path}` | the author | the same ref, CID first, so the blob GC and `sync.getBlob` find a blob's space refs in one scan |
 | `sL/{did}\0{uri}\0{h\|s}` | the account | `listSpaces`'s index, in URI order: `h` for a repo the account holds, `s` for a live space it governs |
@@ -60,13 +60,17 @@ hash collision fails loudly with `space id collision` instead of mixing two spac
 `sL` is there so a `listSpaces` page is a range scan from its cursor instead of a read of every
 space the account touches. It's written in the same entries that put or take away the `sH` head or
 the live `sS` row, so it never disagrees with them, and check-space says so if it does. A space the
-account both writes in and governs has both rows and is listed once. With a `did` filter the scan
+account both writes in and governs has both rows and is listed once. With a `spaceDid` filter the scan
 covers that authority's URIs only. With `spaceType` alone it seeks past each authority's other
 types, so a page reads its own rows plus about one per authority it skips.
 
-A deleted space keeps its `sS` tombstone so `getSpaceCredential` can answer `SpaceDeleted`. Its
-other host rows are swept, except the `sD` rows of services still owed a `notifySpaceDeleted`, and a
-space created again at the same URI starts fresh and drops those rows. `deleteSpace`
+A deleted space keeps its `sS` tombstone so `authorizeSpaceSync` can answer `SpaceDeleted`. Its
+other host rows are swept, except the `sY` rows of registrations still owed a `spaceDeleted` notice,
+and a space created again at the same URI starts fresh and drops those notices unsent.
+
+The Nov 5 alpha's `sN` (registerNotify registrations) and `sD` (notifySpaceDeleted retries) rows
+name a service and no token, so they can't become registrations. Nothing reads them, and the notices
+pass deletes them. A syncer registers again the next time it authorizes. `deleteSpace`
 and `deleteAccount` drop the `sb/` and `sc/` refs with the records.
 
 ## Private log entries

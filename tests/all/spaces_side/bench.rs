@@ -38,11 +38,11 @@
 //! Metrics are process-wide, so run it alone (`--test-threads=1`, no other
 //! test filter). `SPACES_BENCH_SECS` sets each timed window (default 20).
 //! Members (M > 0) need memberspace putMember and member writes (core C3);
-//! syncers need registerNotify and fan-out (C3, C4). With C1 alone run
+//! syncers need a registration and fan-out (C3, C4). With C1 alone run
 //! `SPACES_BENCH_M=0 SPACES_BENCH_SYNCERS=0`.
 
 use super::cluster::Plc;
-use crate::common::spaces::{kem_key_at, mac_type, xrpc_url, Holder, SpaceClient};
+use crate::common::spaces::{kem_key_at, mac_profile, put_members, xrpc_url, Holder, SpaceClient};
 use crate::common::*;
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap};
@@ -309,31 +309,17 @@ impl Reader {
 
     async fn get(&self, nsid: &str, query: &[(&str, &str)]) -> (u16, J, Duration) {
         let mut headers = self.headers.clone();
-        if let Some(ty) = mac_type(nsid) {
+        if let Some(p) = mac_profile(nsid) {
             let kem = self.kem.get_or_init(|| kem_key_at(&self.http, &self.base, &self.repo)).await;
             let (share, _) = vlpds::space::mac::encapsulate(kem.as_deref().expect("a KEM key")).unwrap();
-            let v = vlpds::space::mac::format_want_mac(ty, &share);
-            headers.insert(vlpds::space::mac::WANT_MAC_HEADER, reqwest::header::HeaderValue::from_str(&v).unwrap());
+            let v = vlpds::space::mac::format_request(p, &share);
+            headers.insert(vlpds::space::mac::ACCEPT_SIGNATURE, reqwest::header::HeaderValue::from_str(&v).unwrap());
         }
         let t = Instant::now();
         let r = self.http.get(xrpc_url(&self.base, nsid, query)).headers(headers).send().await.unwrap();
         let status = r.status().as_u16();
         let body = r.bytes().await.unwrap_or_default();
         (status, serde_json::from_slice(&body).unwrap_or(J::Null), t.elapsed())
-    }
-
-    async fn post(&self, nsid: &str, body: &J) -> (u16, J) {
-        let r = self
-            .http
-            .post(xrpc_url(&self.base, nsid, &[]))
-            .headers(self.headers.clone())
-            .json(body)
-            .send()
-            .await
-            .unwrap();
-        let status = r.status().as_u16();
-        let body = r.bytes().await.unwrap_or_default();
-        (status, serde_json::from_slice(&body).unwrap_or(J::Null))
     }
 
     async fn list_repo_ops(&self, space: &str, repo: &str, since: Option<&str>, limit: usize) -> (u16, J, Duration) {
@@ -396,8 +382,8 @@ impl Fixture {
             let m = SpaceClient::new(nodes[(i + 1) % nodes.len()], &unique_name("sbm"), &member_scope()).await;
             authority
                 .post(
-                    "com.atproto.memberspace.putMember",
-                    json!({"space": space, "did": m.did, "read": true, "write": true}),
+                    "com.atproto.memberspace.putMembers",
+                    put_members(json!({"space": space, "did": m.did, "read": true, "write": true})),
                 )
                 .await
                 .ok();
@@ -699,11 +685,11 @@ fn pollers(
     hs
 }
 
-/// A syncer on loopback (did:web): its notifyWrite handler hands each
-/// notify to a puller that fetches the repo's ops since the rev it last
+/// A syncer on loopback (did:web): it confirms its registrations, and its
+/// notifySpaceUpdate handler hands each update to a puller that fetches the repo's ops since the rev it last
 /// pulled, with the space authority's credential.
 struct Syncer {
-    did: String,
+    url: String,
     notified: Arc<Mutex<Lat>>,
     pulled: Arc<Mutex<Lat>>,
     notifies: Arc<AtomicU64>,
@@ -733,13 +719,19 @@ impl Syncer {
         let router = axum::Router::new()
             .route("/.well-known/did.json", axum::routing::get(move || std::future::ready(axum::Json(doc.clone()))))
             .route(
-                "/xrpc/com.atproto.space.notifyWrite",
+                "/xrpc/com.atproto.space.confirmRegistration",
+                axum::routing::post(|axum::Json(b): axum::Json<J>| {
+                    std::future::ready(axum::Json(crate::common::spaces::confirmed(&b)))
+                }),
+            )
+            .route(
+                "/xrpc/com.atproto.space.notifySpaceUpdate",
                 axum::routing::post(move |axum::Json(body): axum::Json<J>| {
                     let (tx, sent, n2, c2) = (tx.clone(), sent.clone(), n2.clone(), c2.clone());
                     async move {
                         let now = Instant::now();
                         c2.fetch_add(1, Ordering::Relaxed);
-                        let repo = body["repo"].as_str().unwrap_or_default().to_string();
+                        let repo = body["update"]["repo"].as_str().unwrap_or_default().to_string();
                         if let Some(t) = sent.lock().get(&repo) {
                             n2.lock().push(now.duration_since(*t));
                         }
@@ -768,19 +760,11 @@ impl Syncer {
                 }
             }
         });
-        Syncer { did, notified, pulled, notifies }
+        Syncer { url: base, notified, pulled, notifies }
     }
 
     async fn register(&self, fx: &Fixture) {
-        let http = http();
-        let rd = Reader::new(&http, &fx.authority.srv.base, &fx.authority.holder, &fx.credential, &fx.authority.did);
-        let (st, j) = rd
-            .post(
-                "com.atproto.space.registerNotify",
-                &json!({"space": fx.space, "service": format!("{}#atproto_space_syncer", self.did)}),
-            )
-            .await;
-        assert_eq!(st, 200, "registerNotify: {j}");
+        fx.authority.register(&fx.space, &self.url, "bench").await.ok();
     }
 }
 

@@ -19,8 +19,8 @@ export const APP_SCOPE = [
   `space:${SPACE_TYPE}?authority=*&collection=*&action=read&action=create&action=update&action=delete&manage=create&manage=update&manage=delete`,
   'blob:*/*',
   'repo:*',
-  'rpc:com.atproto.space.notifyCredentialRevoked?aud=*',
-  'rpc:com.atproto.space.notifyWrite?aud=*',
+  'rpc:com.atproto.space.notifyCredentialsRevoked?aud=*',
+  'rpc:com.atproto.space.notifyRepoUpdate?aud=*',
 ].join(' ')
 
 let seq = 0

@@ -18,8 +18,8 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/xrpc/com.atproto.space.updateSpace", post(update_space))
         .route("/xrpc/com.atproto.space.deleteSpace", post(delete_space))
         .route("/xrpc/com.atproto.space.removeWriter", post(remove_writer))
-        .route("/xrpc/com.atproto.memberspace.putMember", post(put_member))
-        .route("/xrpc/com.atproto.memberspace.removeMember", post(remove_member))
+        .route("/xrpc/com.atproto.memberspace.putMembers", post(put_members))
+        .route("/xrpc/com.atproto.memberspace.removeMembers", post(remove_members))
         .route("/xrpc/com.atproto.memberspace.listMembers", get(list_members))
 }
 
@@ -42,6 +42,10 @@ pub(super) async fn assert_space_host(app: &App, space: &Space) -> XResult<()> {
 
 pub(super) fn policy_mismatch() -> XrpcError {
     XrpcError::bad("PolicyMismatch", "Space is not governed by the memberspace policy")
+}
+
+pub(super) fn invalid_cursor() -> XrpcError {
+    XrpcError::bad("InvalidCursor", "Malformed cursor")
 }
 
 pub(super) fn space_not_found() -> XrpcError {
@@ -95,55 +99,71 @@ pub(super) async fn live_space(app: &App, space: &Space) -> XResult<SpaceRow> {
     Ok(row)
 }
 
-/// Reference `authorizeUser`: the authority can't lock itself out of the
+/// Reference `authorizeRepo`: the authority can't lock itself out of the
 /// space it alone can reconfigure; otherwise the policy decides for
-/// `access` (`read` or `write`). A managing app is asked about both, and
-/// one that can't be asked denies.
-pub(super) async fn authorize_user(
+/// `access` (`read` or `write`). `repo` is None for a read with no
+/// delegation token, which only a policy that doesn't gate on the account
+/// admits. Under memberspace a member without write stays out even under
+/// publicWrite. A managing app is asked with no `repo` then, and one that
+/// can't answer is UpstreamFailure, not a denial.
+pub(super) async fn authorize_repo(
     app: &App,
     space: &Space,
     row: &SpaceRow,
-    user: &str,
+    repo: Option<&str>,
     access: &str,
     client_id: Option<&str>,
 ) -> XResult<bool> {
-    if user == space.authority {
+    if repo == Some(&*space.authority) {
         return Ok(true);
     }
     match &row.policy {
         Policy::Personal => Ok(false),
         Policy::Member { public_read, public_write, .. } => {
-            if *(if access == "read" { public_read } else { public_write }) {
+            if access == "read" && *public_read {
                 return Ok(true);
             }
+            let Some(repo) = repo else { return Ok(false) };
             let p = app.partition(&space.authority)?;
-            let k = state::space_member_key(&space.authority, &space.sid, user);
+            let k = state::space_member_key(&space.authority, &space.sid, repo);
             let m = p.db.get(k).await.map_err(XrpcError::from_err)?;
             let m = m.map(|v| MemberRow::decode(&v)).transpose().map_err(XrpcError::from_err)?;
-            Ok(m.is_some_and(|m| if access == "read" { m.read } else { m.write }))
+            Ok(match (access, m) {
+                ("read", m) => m.is_some_and(|m| m.read),
+                (_, Some(m)) => m.write,
+                (_, None) => *public_write,
+            })
         }
-        Policy::Managed { managing_app, .. } => Ok(crate::space::host::check_user_access(
-            app,
-            &space.uri,
-            &space.authority,
-            managing_app,
-            user,
-            access,
-            client_id,
-        )
-        .await),
+        Policy::Managed { managing_app, .. } => {
+            let a = crate::space::host::check_access(app, &space.uri, &space.authority, managing_app, repo, client_id)
+                .await
+                .ok_or_else(managing_app_down)?;
+            Ok(if access == "read" { a.read } else { a.write })
+        }
     }
 }
 
-/// Reference `assertSpaceOwner`: the scope for `access`, then the caller
-/// must be the space's authority.
+pub(super) fn managing_app_down() -> XrpcError {
+    XrpcError {
+        status: StatusCode::BAD_GATEWAY,
+        error: "UpstreamFailure".into(),
+        message: "Managing app did not answer".into(),
+    }
+}
+
+/// Reference `assertSpaceAuthority`: the scope for `access`, then the
+/// caller must be the space's authority.
 fn assert_owner(creds: &Credentials, space: &Space, access: SpaceAccess) -> XResult<String> {
     creds.need_space(&space.target(), access)?;
     let did = creds.user_did()?;
     if did != space.authority {
-        return Err(XrpcError::bad("NotSpaceOwner", "Not the space owner"));
+        return Err(not_authority());
     }
     Ok(did.to_string())
+}
+
+pub(super) fn not_authority() -> XrpcError {
+    XrpcError::bad("NotAuthorized", "Not the space authority")
 }
 
 fn req_space(v: &J) -> XResult<Space> {
@@ -201,7 +221,7 @@ async fn create_space(State(app): AppState, Auth(creds): Auth, Json(inp): Json<J
         delete_space_rows(&app, &space).await?;
     }
     submit_space(&app, &did, &space, SpaceOp::CreateSpace { row }).await?;
-    Ok(Json(json!({"uri": space.uri})))
+    Ok(Json(json!({"space": space.uri})))
 }
 
 #[derive(Deserialize)]
@@ -218,7 +238,7 @@ async fn get_space(State(app): AppState, Auth(creds): Auth, Query(q): Query<Spac
     super::authn::check_space_read_account(&creds)?;
     assert_owner(&creds, &space, SpaceAccess::ReadSelf)?;
     let row = live_space(&app, &space).await?;
-    Ok(Json(json!({"uri": row.uri, "policy": row.policy.to_lex()})))
+    Ok(Json(json!({"space": row.uri, "policy": row.policy.to_lex()})))
 }
 
 /// Reference updateSpace: the policy replaced wholesale (omitted fields
@@ -234,24 +254,27 @@ async fn update_space(State(app): AppState, Auth(creds): Auth, Json(inp): Json<J
     Ok(StatusCode::OK)
 }
 
-/// Reference removeWriter: out of listRepos until it writes again while
-/// authorized. Idempotent; not announced to syncers, and its records stay
-/// where they are.
+/// Reference removeWriter: the removal is sequenced (the space's spaceRev
+/// advances), forwarded to registered syncers as a `repoRemoved`, and
+/// listed by listWriters until the repo writes again while authorized.
+/// Idempotent; its records stay where they are.
 async fn remove_writer(State(app): AppState, Auth(creds): Auth, Json(inp): Json<J>) -> XResult<StatusCode> {
     spaces(&app)?;
     let space = req_space(&inp)?;
-    let writer = req_did(&inp, "did")?.to_string();
+    let writer = req_did(&inp, "repo")?.to_string();
     let did = assert_owner(&creds, &space, SpaceAccess::Manage("update"))?;
     assert_space_host(&app, &space).await?;
     submit_space(&app, &did, &space, SpaceOp::RemoveWriter { writer }).await?;
     Ok(StatusCode::OK)
 }
 
-/// Reference deleteSpace: the space becomes a tombstone (getSpaceCredential
+/// Reference deleteSpace: the space becomes a tombstone (authorizeSpaceSync
 /// answers SpaceDeleted from then on), its member list, writer states and
 /// registrations go, and so does the authority's own repo in it; other
-/// members' repos are theirs and stay. Registered services are told, and
-/// a send that fails is retried ([`crate::space::deleted`]). Deleting a deleted space finishes its sweep and is a no-op.
+/// members' repos are theirs and stay. Every registration, lapsed ones
+/// too, is sent `spaceDeleted`, and a send that fails is retried
+/// ([`crate::space::notices`]). Deleting a deleted space finishes its sweep
+/// and is a no-op.
 async fn delete_space(State(app): AppState, Auth(creds): Auth, Json(inp): Json<J>) -> XResult<StatusCode> {
     spaces(&app)?;
     let space = req_space(&inp)?;
@@ -261,10 +284,11 @@ async fn delete_space(State(app): AppState, Auth(creds): Auth, Json(inp): Json<J
         submit_space(&app, &did, &space, SpaceOp::DeleteSpace { deleted_at: vlatproto::events::now_rfc3339() }).await?;
     if let SpaceAck::Deleted { already: false } = ack {
         match crate::space::host::registrations(&app, &did, &space.sid).await {
-            Ok((regs, _)) if !regs.is_empty() => {
+            Ok(regs) if !regs.is_empty() => {
                 let (app, uri) = (app.clone(), space.uri.clone());
                 let sid = space.sid;
-                tokio::spawn(async move { crate::space::deleted::notify(&app, &did, &uri, sid, regs).await });
+                let notice = crate::space::notices::Notice::Deleted;
+                tokio::spawn(async move { crate::space::notices::notify(&app, &did, &uri, sid, regs, notice).await });
             }
             Ok(_) => {}
             Err(e) => {
@@ -290,6 +314,7 @@ pub(super) async fn delete_space_rows(app: &App, space: &Space) -> XResult<()> {
             state::SPACE_MEMBER_FAMILY,
             state::SPACE_WRITER_FAMILY,
             state::SPACE_SEQ_FAMILY,
+            state::SPACE_REGISTRATION_FAMILY,
             state::SPACE_NOTIFY_FAMILY,
             state::SPACE_BLOB_FAMILY,
             state::SPACE_RECORD_FAMILY,
@@ -340,28 +365,69 @@ pub(super) async fn sweep_space_rows(app: &App, space: &Space, fams: &[&[u8]]) -
     Ok(())
 }
 
-/// Reference putMember: both flags replace the member's; without write the
-/// member leaves the writer set. PolicyMismatch outside a memberspace.
-async fn put_member(State(app): AppState, Auth(creds): Auth, Json(inp): Json<J>) -> XResult<StatusCode> {
+/// Members putMembers and removeMembers take at once.
+const MAX_MEMBERS: usize = 100;
+
+/// Reference putMembers: each member's flags replaced, in one commit; a DID
+/// listed twice takes its last entry. One without write leaves the writer
+/// set. PolicyMismatch outside a memberspace.
+async fn put_members(State(app): AppState, Auth(creds): Auth, Json(inp): Json<J>) -> XResult<StatusCode> {
     spaces(&app)?;
     let space = req_space(&inp)?;
-    let member = req_did(&inp, "did")?.to_string();
-    let access = MemberRow { read: req_bool(&inp, "read")?, write: req_bool(&inp, "write")? };
-    let did = assert_owner(&creds, &space, SpaceAccess::Manage("update"))?;
-    assert_space_host(&app, &space).await?;
-    submit_space(&app, &did, &space, SpaceOp::PutMember { member, access }).await?;
-    Ok(StatusCode::OK)
+    let list = req_list(&inp, "members")?;
+    let mut members: Vec<(String, Option<MemberRow>)> = Vec::with_capacity(list.len());
+    for m in list {
+        let access = MemberRow { read: req_bool(m, "read")?, write: req_bool(m, "write")? };
+        set_last(&mut members, req_did(m, "did")?, Some(access));
+    }
+    set_members(&app, &creds, &space, members).await
 }
 
-/// Reference removeMember, which also drops the member from the writer
-/// set. PolicyMismatch outside a memberspace.
-async fn remove_member(State(app): AppState, Auth(creds): Auth, Json(inp): Json<J>) -> XResult<StatusCode> {
+/// Reference removeMembers: in one commit, each member leaves the list and
+/// the writer set; a DID that isn't a member is ignored, its writer state
+/// left alone. PolicyMismatch outside a memberspace.
+async fn remove_members(State(app): AppState, Auth(creds): Auth, Json(inp): Json<J>) -> XResult<StatusCode> {
     spaces(&app)?;
     let space = req_space(&inp)?;
-    let member = req_did(&inp, "did")?.to_string();
-    let did = assert_owner(&creds, &space, SpaceAccess::Manage("update"))?;
-    assert_space_host(&app, &space).await?;
-    submit_space(&app, &did, &space, SpaceOp::RemoveMember { member }).await?;
+    let list = req_list(&inp, "dids")?;
+    let mut members = Vec::with_capacity(list.len());
+    for d in list {
+        let did = d.as_str().filter(|d| vlatproto::syntax::valid_did(d));
+        set_last(&mut members, did.ok_or_else(|| XrpcError::bad("InvalidRequest", "dids must be DIDs"))?, None);
+    }
+    set_members(&app, &creds, &space, members).await
+}
+
+fn req_list<'a>(v: &'a J, k: &str) -> XResult<&'a Vec<J>> {
+    let list = v
+        .get(k)
+        .and_then(|l| l.as_array())
+        .ok_or_else(|| XrpcError::bad("InvalidRequest", format!("{k} must be an array")))?;
+    if list.len() > MAX_MEMBERS {
+        return Err(XrpcError::bad("InvalidRequest", format!("{k} must not be longer than {MAX_MEMBERS} elements")));
+    }
+    Ok(list)
+}
+
+/// One entry per DID, in first-listed order, holding its last value.
+fn set_last(members: &mut Vec<(String, Option<MemberRow>)>, did: &str, access: Option<MemberRow>) {
+    match members.iter_mut().find(|(d, _)| d == did) {
+        Some(m) => m.1 = access,
+        None => members.push((did.to_string(), access)),
+    }
+}
+
+async fn set_members(
+    app: &App,
+    creds: &Credentials,
+    space: &Space,
+    members: Vec<(String, Option<MemberRow>)>,
+) -> XResult<StatusCode> {
+    let did = assert_owner(creds, space, SpaceAccess::Manage("update"))?;
+    assert_space_host(app, space).await?;
+    // writers it drops go to registered syncers as repoRemoved, from the
+    // authority's worker once the entry is durable
+    submit_space(app, &did, space, SpaceOp::SetMembers { members }).await?;
     Ok(StatusCode::OK)
 }
 
@@ -387,6 +453,7 @@ async fn list_members(State(app): AppState, Auth(creds): Auth, Query(q): Query<L
     let p = app.partition(&space.authority)?;
     let prefix = state::space_prefix(state::SPACE_MEMBER_FAMILY, &space.authority, &space.sid);
     let lo = match &q.cursor {
+        Some(c) if !vlatproto::syntax::valid_did(c) => return Err(invalid_cursor()),
         Some(c) => [&prefix[..], c.as_bytes(), &[0]].concat(),
         None => prefix.clone(),
     };

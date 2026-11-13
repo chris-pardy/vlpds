@@ -1278,7 +1278,8 @@ pub fn describe_permission(p: &Permission) -> String {
     }
 }
 
-/// Reference consent `SpaceRow`: the declaration's name for the type, the
+/// Reference consent `SpaceRow`: the declaration's title for the type (its
+/// NSID without one), the
 /// authority's verified handle (else its DID), and a bare grant's writes as
 /// its declaration's collections, which is what the token will carry.
 pub fn describe_space(p: &SpacePermission, names: &SpaceNames) -> String {
@@ -1291,7 +1292,7 @@ pub fn describe_space(p: &SpacePermission, names: &SpaceNames) -> String {
         "self" => "your account".to_string(),
         did => names.handles.get(did).map(|h| format!("@{h}")).unwrap_or_else(|| did.to_string()),
     };
-    let kind = decl.map(|d| d.name.clone()).unwrap_or_else(|| p.space_type.clone());
+    let kind = decl.and_then(|d| d.title.clone()).unwrap_or_else(|| p.space_type.clone());
     let what = match (p.space_type.as_str(), p.authority.as_str()) {
         ("*", "*") => "All spaces on the network".to_string(),
         ("*", _) => format!("All spaces on {owner}"),
@@ -1568,8 +1569,8 @@ mod tests {
 
     fn boards_names(name: &str) -> SpaceNames {
         let decl = crate::lexicon::SpaceDecl {
-            name: name.into(),
-            name_lang: vec![],
+            title: Some(name.into()),
+            title_lang: vec![],
             description: None,
             key: None,
             collections: ["post", "comment", "vote"].map(|c| format!("dev.example.boards.{c}")).to_vec(),

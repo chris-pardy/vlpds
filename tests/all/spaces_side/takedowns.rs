@@ -305,15 +305,15 @@ async fn taken_down_authority_issues_no_credentials() {
     let (r, _) = t.net.mint_credential(&t.space, &token, None).await;
     assert!(r.json["credential"].is_null(), "{}", r.text());
     assert_eq!(r.error_name(), Some("RepoTakendown"), "{}", r.text());
-    let lr = before.get(&t.net.pds[0].url, "com.atproto.space.listRepos", &[("space", &t.space)]).await;
-    assert!((400..500).contains(&lr.status), "listRepos at a taken-down authority: {}", lr.text());
+    let lr = before.get(&t.net.pds[0].url, "com.atproto.space.listWriters", &[("space", &t.space)]).await;
+    assert!((400..500).contains(&lr.status), "listWriters at a taken-down authority: {}", lr.text());
     takedown_account(&t.net.pds[0], &t.alice.did, false).await;
     let token = delegation_token(&t.carol, &t.space).await;
     t.net.mint_credential(&t.space, &token, None).await.0.ok();
 }
 
 /// A space takedown (vlpds extension, plan §2.8) at the authority's host:
-/// getSpaceCredential answers NotAuthorized, listRepos SpaceNotFound, and
+/// authorizeSpaceSync answers NotAuthorized, listWriters SpaceNotFound, and
 /// reads of member repos on that host are refused; restored, all of it
 /// works again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -335,7 +335,7 @@ async fn space_takedown_closes_the_space_at_its_host() {
     let (r, _) = t.net.mint_credential(&t.space, &token, None).await;
     assert_eq!(r.error_name(), Some("SpaceNotFound"), "{}", r.text());
     assert!(!r.text().contains("taken down"), "{}", r.text());
-    before.get(&pds0, "com.atproto.space.listRepos", &[("space", &t.space)]).await.err(400, "SpaceNotFound");
+    before.get(&pds0, "com.atproto.space.listWriters", &[("space", &t.space)]).await.err(400, "SpaceNotFound");
     let r = before.get(&pds0, "com.atproto.space.listRecords", &q).await;
     assert!((400..500).contains(&r.status) && !r.text().contains("dave's"), "{}", r.text());
 
@@ -345,10 +345,10 @@ async fn space_takedown_closes_the_space_at_its_host() {
     before.get(&pds0, "com.atproto.space.listRecords", &q).await.ok();
 }
 
-/// The authority's listRepos row for `repo`: (repoRev, hash).
+/// The authority's listWriters row for `repo`: (repoRev, hash).
 async fn row_at_authority(t: &Td, cred: &Cred, repo: &str) -> Option<(String, Vec<u8>)> {
-    let r = cred.get(&t.net.pds[0].url, "com.atproto.space.listRepos", &[("space", &t.space)]).await.ok();
-    let row = r["repos"].as_array()?.iter().find(|r| r["did"] == json!(repo))?.clone();
+    let r = cred.get(&t.net.pds[0].url, "com.atproto.space.listWriters", &[("space", &t.space)]).await.ok();
+    let row = r["repos"].as_array()?.iter().find(|r| r["repo"] == json!(repo))?.clone();
     Some((row["repoRev"].as_str()?.to_string(), super::fuzz::bytes_field(&row["data"])))
 }
 
@@ -385,7 +385,7 @@ async fn forwarded(syncer: &super::hooks::StubDid, repo: &str, rev: &str, hash: 
 
 /// A record takedown and its reversal are pushed, not left to polls: the
 /// author's host notifies the authority with the hash it now serves at the
-/// same rev, listRepos shows it within milliseconds, and a registered
+/// same rev, listWriters shows it within milliseconds, and a registered
 /// syncer gets a forward, sees the same rev with another hash and
 /// converges with getRepo. Through all of it, no prevSpaceRev forks.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -397,8 +397,7 @@ async fn record_takedown_and_reversal_are_pushed_to_the_authority_and_its_syncer
     let rev = repo_state(&t.bob, &t.space).await.unwrap().0;
     let stub = super::hooks::StubDid::spawn().await;
     let acred = t.net.credential_for(&t.alice, &t.space).await;
-    let reg = json!({"space": t.space, "service": format!("{}#atproto_space_syncer", stub.did)});
-    acred.post(&t.net.pds[0].url, "com.atproto.space.registerNotify", reg).await.ok();
+    t.net.register(&t.alice, &t.space, stub.notify()).await.ok();
     let mut syncer = Syncer::new(&base, &t.space, &t.bob.did, t.net.credential_for(&t.carol, &t.space).await);
     syncer.full().await;
     let all = syncer.set.clone();
@@ -408,7 +407,7 @@ async fn record_takedown_and_reversal_are_pushed_to_the_authority_and_its_syncer
     let mut visible = all.clone();
     visible.remove(&path("gone"));
     let took = authority_lists(&t, &acred, &t.bob.did, &rev, &set_hash(&visible), "the takedown").await;
-    eprintln!("the takedown reached listRepos in {took:?}");
+    eprintln!("the takedown reached listWriters in {took:?}");
     forwarded(&stub, &t.bob.did, &rev, &set_hash(&visible), "the takedown").await;
     // the spec's signal: the same rev with another hash, so a full pull
     let pulls = syncer.full_pulls;
@@ -418,7 +417,7 @@ async fn record_takedown_and_reversal_are_pushed_to_the_authority_and_its_syncer
 
     t.takedown_bobs("gone", &gone, false).await;
     let took = authority_lists(&t, &acred, &t.bob.did, &rev, &set_hash(&all), "the reversal").await;
-    eprintln!("the reversal reached listRepos in {took:?}");
+    eprintln!("the reversal reached listWriters in {took:?}");
     forwarded(&stub, &t.bob.did, &rev, &set_hash(&all), "the reversal").await;
     syncer.full().await;
     assert_eq!(syncer.set, all);
@@ -478,24 +477,23 @@ async fn same_rev_notifies_with_made_up_hashes_are_dropped() {
     let t = td().await;
     let stub = super::hooks::StubDid::spawn().await;
     let acred = t.net.credential_for(&t.alice, &t.space).await;
-    let reg = json!({"space": t.space, "service": format!("{}#atproto_space_syncer", stub.did)});
-    acred.post(&t.net.pds[0].url, "com.atproto.space.registerNotify", reg).await.ok();
+    t.net.register(&t.alice, &t.space, stub.notify()).await.ok();
     t.bob_writes("one", "one").await;
     let rev = repo_state(&t.bob, &t.space).await.unwrap().0;
     let held = listed(&t.net.pds[1].url, &acred, &t.space, &t.bob.did).await;
     authority_lists(&t, &acred, &t.bob.did, &rev, &set_hash(&held), "bob's write").await;
-    // the real write's forward leaves after listRepos shows it: counted
+    // the real write's forward leaves after listWriters shows it: counted
     // before the fakes, so a late one can't pass for a fake's
     forwarded(&stub, &t.bob.did, &rev, &set_hash(&held), "bob's write").await;
     let forwards = stub.seen().len();
     let (unverified, capped) = (notifies_in("same_rev_unverified"), notifies_in("same_rev_capped"));
 
     let aud = vlpds::space::token::space_host_aud(&t.alice.did);
-    let jwt = service_jwt(&t.bob, &aud, "com.atproto.space.notifyWrite").await;
+    let jwt = service_jwt(&t.bob, &aud, "com.atproto.space.notifyRepoUpdate").await;
     let spam = 10;
     for _ in 0..spam {
         let body = json!({"space": t.space, "repo": t.bob.did, "repoRev": rev, "data": json_bytes(&rand::random::<[u8; 32]>())});
-        post_service(&t.net.pds[0].url, "com.atproto.space.notifyWrite", &jwt, body).await.ok();
+        post_service(&t.net.pds[0].url, "com.atproto.space.notifyRepoUpdate", &jwt, body).await.ok();
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(row_at_authority(&t, &acred, &t.bob.did).await, Some((rev.clone(), set_hash(&held))));

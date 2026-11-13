@@ -66,11 +66,13 @@ impl Syntax {
         Some(Syntax { prefix, positional: None, params: Params::Lex(perm.clone()) })
     }
 
-    /// A space type is `spaceType` in a lexicon permission (whose `type` is
-    /// "permission"), and indigo's scope strings take that name too.
+    /// A space type is `spaceType` (since the Nov 12 alpha; a lexicon
+    /// permission, whose `type` is "permission", and indigo always said
+    /// so). A scope string's `type`, the Nov 5 alpha's name, is still read:
+    /// grants and app passwords stored before hold it.
     fn canonical<'a>(&self, key: &'a str) -> &'a str {
         match (self.prefix.as_str(), key) {
-            ("space", "spaceType") => "type",
+            ("space", "type") => "spaceType",
             _ => key,
         }
     }
@@ -109,9 +111,8 @@ impl Syntax {
                 }
             }
             Params::Lex(m) => {
-                let key = match (self.prefix.as_str(), key) {
-                    ("space", "type") => "spaceType",
-                    (_, "type" | "resource") => return Param::Absent,
+                let key = match key {
+                    "type" | "resource" => return Param::Absent,
                     _ => key,
                 };
                 match m.get(key) {
@@ -555,7 +556,7 @@ static SPACE: Schema = Schema {
     prefix: "space",
     params: &[
         ParamDef {
-            name: "type",
+            name: "spaceType",
             multiple: false,
             required: true,
             default: None,
@@ -603,7 +604,7 @@ static SPACE: Schema = Schema {
             normalize: Some(n_repo_action),
         },
     ],
-    positional: Some("type"),
+    positional: Some("spaceType"),
 };
 
 static INCLUDE: Schema = Schema {
@@ -730,7 +731,7 @@ impl SpacePermission {
             SpaceAccess::WriteAny(action) => (one("*"), one(action), None),
         };
         SPACE.format(&vec![
-            ("type", one(t.space_type)),
+            ("spaceType", one(t.space_type)),
             ("authority", one(t.authority)),
             ("skey", one(t.skey)),
             ("collection", collection),
@@ -785,7 +786,7 @@ impl Permission {
             "space" => {
                 let v = SPACE.parse(syn)?;
                 Some(Permission::Space(SpacePermission {
-                    space_type: first(&v, "type"),
+                    space_type: first(&v, "spaceType"),
                     authority: first(&v, "authority"),
                     skey: first(&v, "skey"),
                     collection: val(&v, "collection").cloned(),
@@ -820,7 +821,7 @@ impl Permission {
             }
             Permission::Identity { attr } => IDENTITY.format(&vec![("attr", Some(vec![attr.clone()]))]),
             Permission::Space(p) => SPACE.format(&vec![
-                ("type", Some(vec![p.space_type.clone()])),
+                ("spaceType", Some(vec![p.space_type.clone()])),
                 ("authority", Some(vec![p.authority.clone()])),
                 ("skey", Some(vec![p.skey.clone()])),
                 ("collection", p.collection.clone()),
@@ -1027,16 +1028,17 @@ impl ScopeSet {
     /// Whether a `space:` grant covers a service token for space method
     /// `lxm`, which an app sends to another host as `user`: a revocation
     /// needs authority powers (`manage`, or the user's own spaces), a
-    /// notifyWrite a write action, anything else some space grant.
+    /// notifyRepoUpdate (notifyWrite before the Nov 12 alpha) a write
+    /// action, anything else some space grant.
     /// `transition:generic` and `rpc:` alone never do.
     pub fn allows_space_service_auth(&self, lxm: &str, user: &str) -> bool {
         let lxm = lxm.to_ascii_lowercase();
         self.perms.iter().any(|p| match p {
             Permission::Space(s) => match lxm.as_str() {
-                "com.atproto.space.notifycredentialrevoked" => {
+                "com.atproto.space.notifycredentialsrevoked" | "com.atproto.space.notifycredentialrevoked" => {
                     s.manage.as_ref().is_some_and(|m| !m.is_empty()) || s.authority == user
                 }
-                "com.atproto.space.notifywrite" => s.writes(),
+                "com.atproto.space.notifyrepoupdate" | "com.atproto.space.notifywrite" => s.writes(),
                 _ => true,
             },
             _ => false,
@@ -1338,8 +1340,9 @@ mod tests {
     }
 
     /// indigo atproto/auth/testdata/permission_scopes_{valid,invalid}.txt
-    /// (PR #1445): its `space` lines. indigo names the type `spaceType` where
-    /// the reference says `type`; both are taken.
+    /// (PR #1445): its `space` lines. indigo and the reference (since the
+    /// Nov 12 alpha) name the type `spaceType`; the Nov 5 alpha's `type` is
+    /// still read.
     #[test]
     fn indigo_space_scopes() {
         for ok in [

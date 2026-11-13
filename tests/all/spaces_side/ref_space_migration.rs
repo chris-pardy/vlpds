@@ -4,7 +4,7 @@
 //! is covered by `import_repo` and the harness's migrate e2e.
 
 use super::ref_net::*;
-use crate::common::spaces::SpaceClient;
+use crate::common::spaces::{remove_members, SpaceClient};
 use crate::common::*;
 use vlatproto::cbor::Value;
 use vlpds::space::meta::{self, Archive};
@@ -16,7 +16,7 @@ async fn export(actor: &SpaceClient, space: &str) -> Vec<u8> {
 }
 
 async fn import(actor: &SpaceClient, archive: Vec<u8>) -> Resp {
-    actor.post_bytes("com.atproto.space.importSpaceMeta", &[], archive, "application/octet-stream").await
+    actor.post_bytes("com.atproto.space.importSpaceMeta", &[], archive, "application/vnd.dasl.star").await
 }
 
 async fn members(actor: &SpaceClient, space: &str) -> Vec<J> {
@@ -53,11 +53,14 @@ async fn the_space_meta_archive_round_trips() {
     want.sort();
     assert_eq!(got, want);
     assert_eq!(net.writer_dids(&alice, &space).await, writers, "the writer set, in spaceRev order");
-    // the spaceRevs survive, so a listRepos cursor still works
+    // the spaceRevs survive, so a listWriters cursor still works
     assert_eq!(meta::read(&export(&alice, &space).await).unwrap().writers, read.writers);
 
     // again, after a member left: the archive replaces the list
-    alice.post("com.atproto.memberspace.removeMember", json!({"space": space, "did": dan.did})).await.ok();
+    alice
+        .post("com.atproto.memberspace.removeMembers", remove_members(json!({"space": space, "did": dan.did})))
+        .await
+        .ok();
     import(&alice, archive).await.ok();
     assert_eq!(members(&alice, &space).await.len(), 2);
 }
@@ -80,8 +83,8 @@ async fn rejects_an_archive() {
     import(&alice, with(json!({"$type": "com.example.policy"}), vec![])).await.err(400, "UnsupportedPolicy");
     import(&alice, with(memberspace(json!({})), vec![("com.example.thing/x".into(), member.clone())]))
         .await
-        .err(400, "InvalidRequest");
-    import(&alice, with(personalspace(), vec![(key, member)])).await.err(400, "InvalidRequest");
-    import(&alice, b"not a star archive".to_vec()).await.err(400, "InvalidRequest");
-    import(&bob, meta::write(&base)).await.err(400, "NotSpaceOwner");
+        .err(400, "InvalidSpaceMeta");
+    import(&alice, with(personalspace(), vec![(key, member)])).await.err(400, "InvalidSpaceMeta");
+    import(&alice, b"not a star archive".to_vec()).await.err(400, "InvalidSpaceMeta");
+    import(&bob, meta::write(&base)).await.err(400, "NotAuthorized");
 }

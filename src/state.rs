@@ -34,7 +34,7 @@
 //! sH/{did}\0{sid}                   -> space repo head: URI, rev, LtHash state, count, created
 //! sR/{did}\0{sid}{coll}/{rkey}      -> record cid | rev | record bytes (as `R/`)
 //! sO/{did}\0{sid}{rev u64}{idx u16} -> oplog op: action, coll, rkey, cid?, prev?
-//! sP/{did}\0{sid}                   -> notifyWrite outbox: URI, repoRev, hash
+//! sP/{did}\0{sid}                   -> notifyRepoUpdate outbox: URI, repoRev, hash
 //! sb/{did}\0{sid}{cid}\0{path}       -> rev (space blob refs: space.listBlobs/getBlob)
 //! sc/{did}\0{cid}\0{sid}{path}       -> empty (the same refs by CID: blob GC)
 //!
@@ -42,9 +42,16 @@
 //!
 //! sS/{auth}\0{sid}                  -> the space (JSON: URI, policies, created, deleted)
 //! sM/{auth}\0{sid}{member}          -> member access
-//! sW/{auth}\0{sid}{writer}          -> writer state: repoRev, hash, spaceRev
-//! sQ/{auth}\0{sid}{spaceRev u64}    -> writer DID (listRepos order; latest state per writer only)
-//! sN/{auth}\0{sid}{service}         -> notify registration: endpoint, expiry
+//! sW/{auth}\0{sid}{writer}          -> writer state: repoRev, hash, spaceRev, removed
+//! sQ/{auth}\0{sid}{spaceRev u64}    -> writer DID (listWriters order; latest state per writer only)
+//! sG/{auth}\0{sid}{reg id}          -> notify registration: endpoint, token, expiry, expiry notified
+//! sY/{auth}\0{sid}{reg id}          -> a syncer notice (deletion, expiry) owed to a registration
+//!
+//! `{reg id}` is the first 16 bytes of sha256(endpoint ‖ \0 ‖ token). The
+//! Nov 5 alpha's rows, `sN/{auth}\0{sid}{service}` (a registerNotify
+//! registration) and `sD/{auth}\0{sid}{service}` (a notifySpaceDeleted
+//! retry), name a service and no token, so they can't become registrations:
+//! they're no longer read, and `space::notices` deletes them.
 
 use bytes::{BufMut, Bytes};
 use sha2::{Digest, Sha256};
@@ -213,9 +220,11 @@ pub const SPACE_BLOB_FAMILY: &[u8] = b"sb/";
 pub const SPACE_BLOB_CID_FAMILY: &[u8] = b"sc/";
 pub const SPACE_LIST_FAMILY: &[u8] = b"sL/";
 pub const SPACE_DELETED_FAMILY: &[u8] = b"sD/";
+pub const SPACE_REGISTRATION_FAMILY: &[u8] = b"sG/";
+pub const SPACE_NOTICE_FAMILY: &[u8] = b"sY/";
 
 /// Every Spaces family: rows that must never reach a firehose frame.
-pub const SPACE_FAMILIES: [&[u8]; 13] = [
+pub const SPACE_FAMILIES: [&[u8]; 15] = [
     SPACE_HEAD_FAMILY,
     SPACE_RECORD_FAMILY,
     SPACE_OPLOG_FAMILY,
@@ -229,6 +238,8 @@ pub const SPACE_FAMILIES: [&[u8]; 13] = [
     SPACE_BLOB_CID_FAMILY,
     SPACE_LIST_FAMILY,
     SPACE_DELETED_FAMILY,
+    SPACE_REGISTRATION_FAMILY,
+    SPACE_NOTICE_FAMILY,
 ];
 
 /// Why an account is listed under a space URI in `sL/`.
@@ -321,13 +332,35 @@ pub fn space_seq_key(authority: &str, sid: &SpaceId, space_rev: u64) -> Vec<u8> 
     keyed(authority, SPACE_SEQ_FAMILY, &[authority.as_bytes(), b"\0", sid, &space_rev.to_be_bytes()])
 }
 
+/// A Nov 5 registerNotify registration (no longer read).
 pub fn space_notify_key(authority: &str, sid: &SpaceId, service: &str) -> Vec<u8> {
     keyed(authority, SPACE_NOTIFY_FAMILY, &[authority.as_bytes(), b"\0", sid, service.as_bytes()])
 }
 
-/// A notifySpaceDeleted owed to a service that a send couldn't reach.
+/// A Nov 5 notifySpaceDeleted retry (no longer read).
 pub fn space_deleted_key(authority: &str, sid: &SpaceId, service: &str) -> Vec<u8> {
     keyed(authority, SPACE_DELETED_FAMILY, &[authority.as_bytes(), b"\0", sid, service.as_bytes()])
+}
+
+pub const REG_ID_LEN: usize = 16;
+/// A notify registration's id: its endpoint and token together.
+pub type RegId = [u8; REG_ID_LEN];
+
+pub fn reg_id(endpoint: &str, token: &str) -> RegId {
+    let mut h = Sha256::new();
+    h.update(endpoint.as_bytes());
+    h.update([0]);
+    h.update(token.as_bytes());
+    h.finalize()[..REG_ID_LEN].try_into().unwrap()
+}
+
+pub fn space_registration_key(authority: &str, sid: &SpaceId, id: &RegId) -> Vec<u8> {
+    keyed(authority, SPACE_REGISTRATION_FAMILY, &[authority.as_bytes(), b"\0", sid, id])
+}
+
+/// A notice owed to a registration that a send couldn't reach.
+pub fn space_notice_key(authority: &str, sid: &SpaceId, id: &RegId) -> Vec<u8> {
+    keyed(authority, SPACE_NOTICE_FAMILY, &[authority.as_bytes(), b"\0", sid, id])
 }
 
 /// The CID is in its string form, as in `b/`, so listBlobs pages in the

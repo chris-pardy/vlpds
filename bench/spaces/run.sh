@@ -110,9 +110,15 @@ else
 fi
 export VLPDS_REV="$(cat .scratch/built-branch 2>/dev/null || echo '?') $(cut -c1-12 .scratch/built-rev 2>/dev/null || echo '?')"
 npm install --no-audit --no-fund --silent
-# lib/space.mjs and lib/syncer.mjs run on the boards app's Spaces code (packages/boards)
-boards="$here/../../../boards"
-(cd "$boards" && npm install --no-audit --no-fund --silent)
+# the boards modes run the boards app (packages/boards in the monorepo, beside
+# this package); BOARDS_DIR points at a checkout of it elsewhere
+boards="${BOARDS_DIR:-$here/../../../boards}"
+case "$mode" in
+  boards*)
+    [ -d "$boards/src" ] || { echo "$mode needs the boards app at $boards (BOARDS_DIR)" >&2; exit 2; }
+    (cd "$boards" && npm install --no-audit --no-fund --silent)
+    ;;
+esac
 case "$mode" in
   boards-ui | boards-prod)
     # a build of its own: vite empties its outDir first, under a page another run may be serving

@@ -1,6 +1,6 @@
 // Generates export.star and export.json: a space repo as the reference PDS's
 // com.atproto.space.getRepo serves it (packages/pds/src/api/com/atproto/space/
-// getRepo.ts: buildCommit, then serializeRepo), for vlpds's importRepo tests
+// getRepo.ts: buildCommit, then writeRepoStar), for vlpds's importRepo tests
 // (tests/all/spaces_side/import_repo.rs). Run in packages/space of a built
 // bluesky-social/atproto checkout at the commit in SOURCE, e.g. in the
 // harness's reference image (bench/spaces/refpds.sh):
@@ -11,7 +11,7 @@
 // checked with readRepoStar before it is written.
 import { writeFileSync } from 'node:fs'
 import { cidForRawBytes } from '@atproto/lex-data'
-import { RepoCommit, readRepoStar, serializeRecord, serializeRepo } from './dist/index.js'
+import { RepoCommit, readRepoStar, serializeRecord, writeRepoStar } from './dist/index.js'
 
 const out = process.argv[2] ?? '.'
 const hex = (b) => Buffer.from(b).toString('hex')
@@ -52,10 +52,11 @@ serialized.sort((a, b) => Buffer.compare(Buffer.from(`${a.collection}/${a.rkey}`
 const commit = RepoCommit.fromRecords(serialized).toCommit({ space, repo: did, rev })
 
 const chunks = []
-for await (const c of serializeRepo(commit, serialized)) chunks.push(c)
+for await (const c of writeRepoStar(commit, serialized)) chunks.push(c)
 const star = Buffer.concat(chunks)
 
-await using read = await readRepoStar([star])
+// draining `records` disposes the reader
+const read = await readRepoStar([star])
 let n = 0
 for await (const _ of read.records) n++
 if (n !== recs.length) throw new Error('readRepoStar: record count')
@@ -65,7 +66,7 @@ writeFileSync(
   `${out}/export.json`,
   `${JSON.stringify(
     {
-      generatedBy: 'gen-export.mjs: @atproto/space serializeRepo + RepoCommit.toCommit at the commit in SOURCE',
+      generatedBy: 'gen-export.mjs: @atproto/space writeRepoStar + RepoCommit.toCommit at the commit in SOURCE',
       did,
       space,
       rev,

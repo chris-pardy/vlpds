@@ -1,10 +1,13 @@
-// A syncing service's inbound side: a real did:plc whose
-// `#atproto_space_syncer` entry points here (or at a fault proxy in front of
-// here), so space hosts resolve and reach it like any registered service. It
-// verifies each call's service auth (iss = the space's authority, aud = this
-// service's id, lxm) against the authority's key from the PLC, records it,
-// and hands notifyWrite / notifySpaceDeleted to listeners. It also answers
-// managedspace.checkUserAccess as a managing app.
+// A syncing service's inbound side: the endpoint a syncer registers with
+// authorizeSpaceSync's `notify` (this server, or a fault proxy in front of it),
+// with a token per space. It answers confirmRegistration (echoing the challenge
+// for a token it issued for that space), takes notifySpaceUpdate (no service
+// auth: the token in the body is the registration's), records every call and
+// hands updates to listeners. It also has a real did:plc, so it can answer
+// managedspace.checkAccess as a managing app (`<did>#atproto_space_syncer`);
+// that call's service auth (iss = the space's authority, aud = this service,
+// lxm) is checked against the authority's key from the PLC.
+import { randomBytes } from 'node:crypto'
 import http from 'node:http'
 import { verifySignature } from '@atproto/crypto'
 import { createServiceDid, signingKey } from './identity.mjs'
@@ -17,7 +20,21 @@ export class NotifyService {
     this.calls = []
     this.listeners = new Set()
     this.authFailures = []
-    this.access = () => false // checkUserAccess policy: (space, user, access, clientId) => bool
+    this.access = () => false // checkAccess policy: (space, repo, clientId) => bool | {read, write}
+    this.tokens = new Map() // token -> space
+    this.confirm = () => true // confirmRegistration: false answers a wrong challenge
+    this.accept = () => true // notifySpaceUpdate: false refuses it (400), as a syncer unregistering does
+  }
+
+  get endpoint() {
+    return `http://localhost:${this.publicPort}`
+  }
+
+  /** The `notify` a syncer of `space` registers with (one token per space, kept across authorizations). */
+  register(space) {
+    let token = [...this.tokens].find(([, s]) => s === space)?.[0]
+    if (!token) this.tokens.set((token = randomBytes(16).toString('hex')), space)
+    return { endpoint: this.endpoint, token }
   }
 
   async start() {
@@ -41,6 +58,11 @@ export class NotifyService {
 
   callsTo(lxm, space) {
     return this.calls.filter((c) => c.lxm === lxm && (!space || c.body?.space === space))
+  }
+
+  /** notifySpaceUpdate calls for `space` whose update is `type` (repoWrite, repoRemoved, spaceDeleted, registrationExpired). */
+  updates(space, type) {
+    return this.callsTo('com.atproto.space.notifySpaceUpdate', space).filter((c) => !type || c.body.update?.$type?.endsWith(`#${type}`))
   }
 
   async verifyAuth(auth, lxm, space) {
@@ -82,8 +104,14 @@ export class NotifyService {
       body = raw
     }
     const at = performance.now()
-    const authErr = await this.verifyAuth(req.headers.authorization, lxm, body?.space)
-    const call = { lxm, body, at, wall: Date.now(), authErr }
+    // the registration's token authenticates what a space host sends a syncer
+    const tokenAuthed = lxm === 'com.atproto.space.confirmRegistration' || lxm === 'com.atproto.space.notifySpaceUpdate'
+    const authErr = tokenAuthed
+      ? this.tokens.get(body?.token) === body?.space
+        ? null
+        : `token ${String(body?.token).slice(0, 8)} was not issued for ${body?.space}`
+      : await this.verifyAuth(req.headers.authorization, lxm, body?.space)
+    const call = { lxm, body, at, wall: Date.now(), authErr, auth: req.headers.authorization }
     this.calls.push(call)
     const reply = (status, obj) => {
       res.writeHead(status, { 'content-type': 'application/json' })
@@ -91,11 +119,17 @@ export class NotifyService {
     }
     if (authErr) {
       this.authFailures.push(call)
-      return reply(401, { error: 'AuthRequired', message: authErr })
+      return reply(tokenAuthed ? 400 : 401, { error: tokenAuthed ? 'InvalidRequest' : 'AuthRequired', message: authErr })
     }
-    if (lxm === 'com.atproto.managedspace.checkUserAccess') {
-      const ok = !!this.access(body.space, body.user, body.access, body.clientId)
-      return reply(200, { authorized: ok })
+    if (lxm === 'com.atproto.space.confirmRegistration') {
+      return reply(200, { challenge: this.confirm(body) ? body.challenge : `${body.challenge}x` })
+    }
+    if (lxm === 'com.atproto.managedspace.checkAccess') {
+      const a = this.access(body.space, body.repo, body.clientId)
+      return reply(200, typeof a === 'object' ? a : { read: !!a, write: !!a })
+    }
+    if (lxm === 'com.atproto.space.notifySpaceUpdate' && !this.accept(body)) {
+      return reply(400, { error: 'InvalidRequest', message: 'not registered' })
     }
     for (const fn of this.listeners) {
       try {

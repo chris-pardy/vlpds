@@ -3,7 +3,7 @@
 //! the `atproto-space-meta` STAR archive (`crate::space::meta`). The
 //! policy, its state (memberspace's member list, keyed as the members'
 //! published records would be) and the writer set with their spaceRevs,
-//! so listRepos cursors keep working after the move.
+//! so listWriters cursors keep working after the move.
 //!
 //! An import replaces what this host holds for the space: the member list,
 //! writer states and sequence are swept and written again, then one entry
@@ -34,7 +34,7 @@ fn owner(creds: &Credentials, space: &Space, access: SpaceAccess) -> XResult<Str
     creds.need_space(&space.target(), access)?;
     let did = creds.user_did()?;
     if did != space.authority {
-        return Err(XrpcError::bad("NotSpaceOwner", "Not the space owner"));
+        return Err(super::space_policy::not_authority());
     }
     Ok(did.to_string())
 }
@@ -84,11 +84,16 @@ async fn export_space_meta(State(app): AppState, Auth(creds): Auth, Query(q): Qu
     for (k, v) in scan(&p, &prefix).await? {
         let did = std::str::from_utf8(&k).map_err(XrpcError::from_err)?.to_string();
         let w = WriterRow::decode(&v).map_err(XrpcError::from_err)?;
+        // the archive carries the writer set itself: like a garbage
+        // collection, this drops removals syncers haven't seen yet
+        if w.removed {
+            continue;
+        }
         writers.push(Writer { did, rev: w.repo_rev, data: w.hash, space_rev: w.space_rev });
     }
     let policy = Value::from_json(&row.policy.to_lex()).map_err(XrpcError::from_err)?;
     let body = meta::write(&Archive { space: space.uri.clone(), policy, policy_state, writers });
-    Ok(([(header::CONTENT_TYPE, "application/octet-stream")], body).into_response())
+    Ok(([(header::CONTENT_TYPE, "application/vnd.dasl.star")], body).into_response())
 }
 
 /// The member list in an archive's policy state. A key the policy doesn't
@@ -98,12 +103,12 @@ fn members_of(policy: &Policy, state: &[(String, Value)]) -> XResult<Vec<(String
     for (k, v) in state {
         let did = k.strip_prefix(MEMBER_PREFIX).map(rkey_did);
         let Some(did) = did.filter(|d| policy.is_memberspace() && vlatproto::syntax::valid_did(d)) else {
-            return Err(XrpcError::bad("InvalidRequest", format!("Unrecognized policy state: {k}")));
+            return Err(XrpcError::bad("InvalidSpaceMeta", format!("Unrecognized policy state: {k}")));
         };
         let Value::Map(m) = v else { unreachable!("meta::read checks values are maps") };
         let flag = |name: &str| match m.iter().find(|(key, _)| key == name).map(|(_, v)| v) {
             Some(Value::Bool(b)) => Ok(*b),
-            _ => Err(XrpcError::bad("InvalidRequest", format!("Invalid member at {k}: {name} must be a boolean"))),
+            _ => Err(XrpcError::bad("InvalidSpaceMeta", format!("Invalid member at {k}: {name} must be a boolean"))),
         };
         out.push((did, MemberRow { read: flag("read")?, write: flag("write")? }));
     }
@@ -153,23 +158,23 @@ async fn import_space_meta(
         }
         buf.extend_from_slice(&chunk);
     }
-    let a = meta::read(&buf).map_err(|e| XrpcError::bad("InvalidRequest", e.0))?;
+    let a = meta::read(&buf).map_err(|e| XrpcError::bad("InvalidSpaceMeta", e.0))?;
     drop(buf);
     let space = Space::parse(&a.space)?;
     if space.authority != did {
-        return Err(XrpcError::bad("NotSpaceOwner", "Not the space owner"));
+        return Err(super::space_policy::not_authority());
     }
     owner(&creds, &space, SpaceAccess::Manage("create"))?;
     owner(&creds, &space, SpaceAccess::Manage("update"))?;
     let policy = Policy::from_lex(&a.policy.to_json()).map_err(|e| match e {
         PolicyError::Unsupported(m) => XrpcError::bad("UnsupportedPolicy", m),
-        PolicyError::Invalid(m) => XrpcError::bad("InvalidRequest", m),
+        PolicyError::Invalid(m) => XrpcError::bad("InvalidSpaceMeta", m),
     })?;
     let members = members_of(&policy, &a.policy_state)?;
     let mut writers = a.writers;
     writers.sort_by_key(|w| w.space_rev);
     if writers.windows(2).any(|w| w[0].space_rev == w[1].space_rev) {
-        return Err(XrpcError::bad("InvalidRequest", "two writers at one spaceRev"));
+        return Err(XrpcError::bad("InvalidSpaceMeta", "two writers at one spaceRev"));
     }
     super::space_policy::sweep_space_rows(
         &app,
@@ -188,7 +193,7 @@ async fn import_space_meta(
     }
     let mut prev: Option<Tid> = None;
     for w in &writers {
-        let row = WriterRow { repo_rev: w.rev, hash: w.data, space_rev: w.space_rev };
+        let row = WriterRow { repo_rev: w.rev, hash: w.data, space_rev: w.space_rev, removed: false };
         muts.push(put(state::space_writer_key(&did, &space.sid, &w.did), row.encode()));
         let seq = SeqRow { prev, writer: w.did.clone() };
         muts.push(put(state::space_seq_key(&did, &space.sid, w.space_rev.0), seq.encode()));

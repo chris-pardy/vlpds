@@ -20,7 +20,7 @@ use crate::common::spaces::{Holder, SpaceClient};
 use crate::common::*;
 use vlpds::space::token::{space_host_aud, Mint, TokenType};
 
-const NOTIFY_REVOKED: &str = "com.atproto.space.notifyCredentialRevoked";
+const NOTIFY_REVOKED: &str = "com.atproto.space.notifyCredentialsRevoked";
 
 async fn own_reads(dan: &SpaceClient, space: &str, repo: &str) -> Vec<Resp> {
     let base = [("space", space), ("repo", repo)];
@@ -244,7 +244,7 @@ async fn requires_the_authority_as_audience_for_space_host_requests() {
     let space = net.create_space(&alice, SpaceOpts { members: &[&bob], ..Default::default() }).await;
     let cred = net.credential_for(&bob, &space).await;
     let q = [("space", space.as_str())];
-    cred.get_for(&net.pds[0].url, "com.atproto.space.listRepos", &q, &bob.did).await.err(401, "BadSpaceAudience");
+    cred.get_for(&net.pds[0].url, "com.atproto.space.listWriters", &q, &bob.did).await.err(401, "BadSpaceAudience");
 }
 
 /// HTTP message signature binding: "reuses a signature for the same
@@ -263,7 +263,8 @@ async fn reuses_a_signature_for_the_same_audience_across_requests() {
         raw_get(base, "com.atproto.space.listRecords", &q, &h).await.ok();
     }
     raw_get(base, "com.atproto.space.listBlobs", &q, &h).await.ok();
-    raw_post(base, "com.atproto.space.registerNotify", json!({"space": space, "service": alice.did}), &h).await.ok();
+    // and a space host method, addressed to the same audience
+    raw_get(base, "com.atproto.space.listWriters", &[("space", space.as_str())], &h).await.ok();
 }
 
 /// HTTP message signature binding: "reuses one credential across many
@@ -325,8 +326,8 @@ async fn refuses_a_credential_the_authority_did_not_issue() {
     let forged = Cred { credential: forged, holder, http: reqwest::Client::new() };
     let r = forged.get(base, "com.atproto.space.getLatestCommit", &q).await;
     refused_mentioning(&r, &["not the space authority"]);
-    // listRepos authorizes off the credential too, on a separate path.
-    let r = forged.get(base, "com.atproto.space.listRepos", &[("space", &space)]).await;
+    // listWriters authorizes off the credential too, on a separate path.
+    let r = forged.get(base, "com.atproto.space.listWriters", &[("space", &space)]).await;
     refused_mentioning(&r, &["not the space authority"]);
 }
 
@@ -345,7 +346,7 @@ async fn refuses_a_credential_for_a_removed_member() {
 // credential revocation
 // ---------------------------------------------------------------------------
 
-/// `revoke(signer, space, credentials, {aud, lxm})`: notifyCredentialRevoked
+/// `revoke(signer, space, credentials, {aud, lxm})`: notifyCredentialsRevoked
 /// at bob's PDS with service auth from `signer`.
 async fn revoke(net: &Net, signer: &SpaceClient, aud: &str, lxm: &str, space: &str, jtis: &[String]) -> Resp {
     let jwt = service_jwt(signer, aud, lxm).await;
@@ -402,7 +403,7 @@ async fn revocation_requires_service_auth_from_the_authority() {
     refused_mentioning(&revoke(&net, &alice, &alice.did, NOTIFY_REVOKED, &space, &jtis).await, &["aud"]);
     let pds2_did = net.pds[1].pds_did().await;
     refused_mentioning(&revoke(&net, &alice, &pds2_did, NOTIFY_REVOKED, &space, &jtis).await, &["aud"]);
-    revoke(&net, &alice, &bob.did, "com.atproto.space.notifyWrite", &space, &jtis).await.client_err();
+    revoke(&net, &alice, &bob.did, "com.atproto.space.notifyRepoUpdate", &space, &jtis).await.client_err();
     let not_service_auth = Auth::Bearer(alice.session_jwt.clone());
     Xrpc::new(&net.pds[1].url)
         .post(NOTIFY_REVOKED, &json!({"space": space, "credentials": jtis}), &not_service_auth)
@@ -461,8 +462,8 @@ async fn refuses_to_bind_the_credential_to_a_key_that_is_not_p256() {
     let space = net.create_space(&alice, SpaceOpts { members: &[&carol], ..Default::default() }).await;
     let token = delegation_token(&carol, &space).await;
     let k256 = vlatproto::crypto::Keypair::generate().did_key();
-    let body = json!({"space": space, "credentialKid": k256, "delegationToken": token});
-    let r = raw_post(&net.pds[0].url, "com.atproto.space.getSpaceCredential", body, &[]).await;
+    let body = json!({"space": space, "credentialKey": k256, "delegationToken": token});
+    let r = raw_post(&net.pds[0].url, "com.atproto.space.authorizeSpaceSync", body, &[]).await;
     r.err(400, "InvalidRequest");
     assert!(r.json["message"].as_str().unwrap().contains("P-256"), "{r:?}");
 }
@@ -673,11 +674,11 @@ async fn oauth_requires_a_wildcard_grant_to_list_spaces_unfiltered() {
     let app = regrant(&alice, &grant(&alice, "action=read_self")).await;
     scope_missing(&app.get("com.atproto.space.listSpaces", &[]).await);
     let listed =
-        app.get("com.atproto.space.listSpaces", &[("spaceType", TEST_SPACE_TYPE), ("did", &alice.did)]).await.ok();
-    let uris: Vec<&str> = listed["spaces"].as_array().unwrap().iter().filter_map(|s| s["uri"].as_str()).collect();
+        app.get("com.atproto.space.listSpaces", &[("spaceType", TEST_SPACE_TYPE), ("spaceDid", &alice.did)]).await.ok();
+    let uris: Vec<&str> = listed["spaces"].as_array().unwrap().iter().filter_map(|s| s["space"].as_str()).collect();
     assert!(uris.contains(&space.as_str()), "{listed}");
     scope_missing(
-        &app.get("com.atproto.space.listSpaces", &[("spaceType", OTHER_SPACE_TYPE), ("did", &alice.did)]).await,
+        &app.get("com.atproto.space.listSpaces", &[("spaceType", OTHER_SPACE_TYPE), ("spaceDid", &alice.did)]).await,
     );
 }
 

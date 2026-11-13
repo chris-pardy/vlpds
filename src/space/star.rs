@@ -275,11 +275,16 @@ pub fn parse_repo_meta(meta: &Value) -> Result<super::commit::Commit, StarError>
     if vlatproto::syntax::parse_space_uri(&space).is_none_or(|s| s.record.is_some()) {
         return err("invalid repo metadata: space");
     }
+    // a TID since the Nov 12 alpha's `commitSchema`
+    let rev = text("rev")?;
+    if vlatproto::tid::Tid::parse(&rev).is_none() {
+        return err("invalid repo metadata: rev must be a TID");
+    }
     if ver != super::commit::COMMIT_VERSION {
         return err(format!("unsupported commit version: {ver}"));
     }
     let data: [u8; 32] = data.try_into().map_err(|_| StarError("invalid repo metadata: data".into()))?;
-    Ok(super::commit::Commit { ver, repo, space, rev: text("rev")?, data })
+    Ok(super::commit::Commit { ver, repo, space, rev, data })
 }
 
 #[cfg(test)]
@@ -377,7 +382,7 @@ mod tests {
             ver: 1,
             repo: "did:plc:x".into(),
             space: "at://did:plc:x/space/com.example.group/self".into(),
-            rev: "3kbcq3p7ad401".into(),
+            rev: "3kbcq3p7ad4a3".into(),
             data: [0; 32],
         };
         let mut out = Vec::new();
@@ -404,6 +409,12 @@ mod tests {
         };
         assert_eq!(parse_repo_meta(&meta).unwrap_err().0, "unsupported commit version: 2");
         m.clear();
+        // a rev that isn't a TID
+        let mut b = Vec::new();
+        write_header(&mut b, &repo_meta(&crate::space::commit::Commit { rev: "1".into(), ..c.clone() }));
+        write_end(&mut b);
+        let (meta, _) = read_all(&b, LIMITS).unwrap();
+        assert!(parse_repo_meta(&meta).unwrap_err().0.contains("rev must be a TID"));
         // a varint
         for n in [0u64, 127, 128, 300, 1 << 40] {
             let mut v = Vec::new();

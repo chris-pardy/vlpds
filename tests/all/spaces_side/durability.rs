@@ -18,7 +18,7 @@
 
 use super::fuzz::{bytes_field, fold, signed_commit};
 use super::hooks::*;
-use crate::common::spaces::{space_uri, SpaceClient};
+use crate::common::spaces::{put_members, space_uri, SpaceClient};
 use crate::common::*;
 use base64::Engine;
 use std::collections::{BTreeMap, BTreeSet};
@@ -29,7 +29,7 @@ use vlpds::space::commit::{self, Commit};
 use vlpds::space::lthash::LtHash;
 
 const SHARDS: u32 = 4;
-const NOTIFY: &str = "com.atproto.space.notifyWrite";
+const NOTIFY: &str = "com.atproto.space.notifyRepoUpdate";
 
 type Bucket = Arc<object_store::memory::InMemory>;
 
@@ -120,10 +120,10 @@ pub(super) async fn replay(sc: &SpaceClient, space: &str, credential: &str, ctx:
         let r = sc.signed_get(&base, "com.atproto.space.listRepoOps", &q, credential, &sc.did).await;
         assert_eq!(r.status, 200, "{ctx}: listRepoOps: {}", r.text());
         ops.extend(r.json["ops"].as_array().cloned().unwrap_or_default());
-        if !r.json["commit"].is_null() {
-            return (ops, signed_commit(&r.json["commit"]));
+        match r.json["cursor"].as_str() {
+            Some(c) => cursor = Some(c.into()),
+            None => return (ops, signed_commit(&r.json["commit"])),
         }
-        cursor = Some(r.json["cursor"].as_str().unwrap_or_else(|| panic!("{ctx}: no commit, no cursor")).into());
     }
     panic!("{ctx}: listRepoOps doesn't end")
 }
@@ -167,16 +167,7 @@ pub(super) async fn consistent(
     (recs, c)
 }
 
-/// A space read/host call with `credential`, signed for `audience`.
-pub(super) async fn signed_post(sc: &SpaceClient, nsid: &str, body: J, credential: &str, audience: &str) -> Resp {
-    let mut rb = sc.srv.http.post(format!("{}/xrpc/{nsid}", sc.srv.base));
-    for (k, v) in sc.holder.headers(&format!("Atproto-Space-Credential {credential}"), audience) {
-        rb = rb.header(k, v);
-    }
-    crate::common::spaces::resp(rb.json(&body).send().await.unwrap()).await
-}
-
-/// listRepos at the authority `auth`, every page.
+/// listWriters at the authority `auth`, every page.
 pub(super) async fn list_repos(auth: &SpaceClient, space: &str, credential: &str) -> Result<Vec<J>, String> {
     let (mut out, mut cursor) = (Vec::new(), None::<String>);
     let base = auth.srv.base.clone();
@@ -185,9 +176,9 @@ pub(super) async fn list_repos(auth: &SpaceClient, space: &str, credential: &str
         if let Some(c) = &cursor {
             q.push(("cursor", c.as_str()));
         }
-        let r = auth.signed_get(&base, "com.atproto.space.listRepos", &q, credential, &auth.did).await;
+        let r = auth.signed_get(&base, "com.atproto.space.listWriters", &q, credential, &auth.did).await;
         if r.status != 200 {
-            return Err(format!("listRepos: {} {}", r.status, r.text()));
+            return Err(format!("listWriters: {} {}", r.status, r.text()));
         }
         let repos = r.json["repos"].as_array().cloned().unwrap_or_default();
         if repos.is_empty() {
@@ -198,9 +189,9 @@ pub(super) async fn list_repos(auth: &SpaceClient, space: &str, credential: &str
     }
 }
 
-/// The latest listRepos row of each repo (a repo may reappear across pages).
+/// The latest listWriters row of each repo (a repo may reappear across pages).
 pub(super) fn by_did(repos: &[J]) -> BTreeMap<String, J> {
-    repos.iter().map(|r| (r["did"].as_str().unwrap().to_string(), r.clone())).collect()
+    repos.iter().map(|r| (r["repo"].as_str().unwrap().to_string(), r.clone())).collect()
 }
 
 // ---------- killed around the segment PUT ----------
@@ -479,7 +470,7 @@ pub(super) async fn burst(sc: &SpaceClient, space: &str, coll: &str, prefix: &st
 
 /// Two nodes; writer `wv` on n2 (the victim), `ws` on n1, the authority on
 /// n2 or n1. Both write in a burst through n1 while n2 is killed. A stub
-/// syncer is registered for the space, and listRepos is polled throughout.
+/// syncer is registered for the space, and listWriters is polled throughout.
 async fn takeover_mid_burst(authority_on_victim: bool) {
     let (bucket, front) = (Bucket::default(), Front::new().await);
     let (n1, _) = hooked_node("tb-1", &bucket, SHARDS, &front).await;
@@ -502,12 +493,11 @@ async fn takeover_mid_burst(authority_on_victim: bool) {
     let space = auth.create_space(&st, "tb").await;
     for w in [&wv, &ws] {
         let m = json!({"space": space, "did": w.did, "read": true, "write": true});
-        auth.post("com.atproto.memberspace.putMember", m).await.ok();
+        auth.post("com.atproto.memberspace.putMembers", put_members(m)).await.ok();
     }
     let syncer = StubDid::spawn().await;
     let cred = auth.credential(&space).await;
-    let reg = json!({"space": space, "service": format!("{}#atproto_space_syncer", syncer.did)});
-    signed_post(&auth, "com.atproto.space.registerNotify", reg, &cred, &auth.did).await.ok();
+    auth.register(&space, &syncer.url, &syncer.token).await.ok();
 
     let stop = AtomicBool::new(false);
     let killed_at = parking_lot::Mutex::new(None::<Instant>);
@@ -577,14 +567,14 @@ async fn takeover_mid_burst(authority_on_victim: bool) {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     eprintln!("authority caught up {:?} after the burst", t.elapsed());
-    // listRepos pages by spaceRev, so a listing that raced a late write's
+    // listWriters pages by spaceRev, so a listing that raced a late write's
     // sequencing shows that repo twice; once caught up nothing moves
-    let fin = list_repos(&auth, &space, &cred).await.expect("listRepos once caught up");
+    let fin = list_repos(&auth, &space, &cred).await.expect("listWriters once caught up");
 
     // the authority sequenced each (repo, repoRev) once, and spaceRevs only
     // moved forward
-    let dids: Vec<&str> = fin.iter().map(|r| r["did"].as_str().unwrap()).collect();
-    assert_eq!(dids.len(), dids.iter().collect::<BTreeSet<_>>().len(), "listRepos repeats a repo: {fin:?}");
+    let dids: Vec<&str> = fin.iter().map(|r| r["repo"].as_str().unwrap()).collect();
+    assert_eq!(dids.len(), dids.iter().collect::<BTreeSet<_>>().len(), "listWriters repeats a repo: {fin:?}");
     let space_revs: BTreeSet<&str> = fin.iter().map(|r| r["spaceRev"].as_str().unwrap()).collect();
     assert_eq!(space_revs.len(), fin.len(), "two repos share a spaceRev: {fin:?}");
     let mut seq: BTreeMap<(String, String), String> = BTreeMap::new();
@@ -624,7 +614,7 @@ async fn takeover_mid_burst(authority_on_victim: bool) {
         assert!(got.iter().any(|n| n.at > killed_at), "fan-out didn't resume on the new owner");
     }
     for n in &got {
-        assert_eq!(n.claims["iss"], json!(auth.did), "{n:?}");
+        assert_eq!((&n.claims, &n.body["token"]), (&J::Null, &json!(syncer.token)), "{n:?}");
     }
 }
 
@@ -653,7 +643,7 @@ async fn inbound_notifies_survive_a_kill_after_their_200() {
     let mut n = OneNode::new("in").await;
     let writer = StubDid::spawn().await;
     let m = json!({"space": n.space, "did": writer.did, "read": false, "write": true});
-    n.sc.post("com.atproto.memberspace.putMember", m).await.ok();
+    n.sc.post("com.atproto.memberspace.putMembers", put_members(m)).await.ok();
     let base = vlatproto::tid::now_micros();
     let revs: Vec<String> = (0..5).map(|i| tid(base, i * 1000)).collect();
     let hashes: Vec<Vec<u8>> = (0..5).map(|_| random_bytes(32)).collect();
@@ -676,7 +666,7 @@ async fn inbound_notifies_survive_a_kill_after_their_200() {
     let cred = n.sc.credential(&n.space).await;
     let rows = list_repos(&n.sc, &n.space, &cred).await.unwrap();
     let after = by_did(&rows);
-    assert_eq!(after.len(), rows.len(), "listRepos repeats a repo: {rows:?}");
+    assert_eq!(after.len(), rows.len(), "listWriters repeats a repo: {rows:?}");
     let w = &after[&writer.did];
     assert_eq!(w["repoRev"], json!(revs[2]), "the acked notify is gone: {w}");
     assert_eq!(bytes_field(&w["data"]), hashes[2]);

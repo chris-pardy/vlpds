@@ -8,7 +8,7 @@
 //! - every s* row is in exactly one open shard, and the rows are the same
 //!   ones with the same values;
 //! - each repo reads the same (records, head, oplog replay) and checks
-//!   clean, and the authority's listRepos is unchanged;
+//!   clean, and the authority's listWriters is unchanged;
 //! - afterwards writes carry on from the heads, the authority sequences
 //!   them, and once the remote authority accepts, the outbox on the shard's
 //!   new owner delivers each writer's newest rev.
@@ -17,13 +17,11 @@
 //! nothing acked is lost and every repo stays consistent.
 
 use super::cluster::{client_on, fronted_node, settle_front, Plc};
-use super::durability::{
-    burst, by_did, consistent, create, latest, list_repos, note, scope, signed_post, Burst, Records,
-};
+use super::durability::{burst, by_did, consistent, create, latest, list_repos, note, scope, Burst, Records};
 use super::fuzz::bytes_field;
 use super::hooks::{Front, StubDid};
 use super::leak::SPACE_FAMILIES;
-use crate::common::spaces::{space_uri, SpaceClient};
+use crate::common::spaces::{put_members, space_uri, SpaceClient};
 use crate::common::*;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -199,15 +197,15 @@ impl World {
         let local = writers[auth].create_space(&st, "local").await;
         for w in &writers[1..] {
             let m = json!({"space": local, "did": w.did, "read": true, "write": true});
-            writers[auth].post("com.atproto.memberspace.putMember", m).await.ok();
+            writers[auth].post("com.atproto.memberspace.putMembers", put_members(m)).await.ok();
         }
         let (stub, syncer) = (StubDid::spawn().await, StubDid::spawn().await);
         stub.refuse(true);
         let remote = space_uri(&stub.did, &st, "remote");
         let credential = writers[auth].credential(&local).await;
-        let reg = json!({"space": local, "service": format!("{}#atproto_space_syncer", syncer.did)});
+
         let a = &writers[auth];
-        signed_post(a, "com.atproto.space.registerNotify", reg, &credential, &a.did).await.ok();
+        a.register(&local, &syncer.url, &syncer.token).await.ok();
         World { _front: front, nodes, auth, writers, local, remote, collection, stub, syncer, credential }
     }
 
@@ -257,12 +255,12 @@ impl World {
         out
     }
 
-    /// listRepos of the local space by did: (repoRev, spaceRev, hash).
+    /// listWriters of the local space by did: (repoRev, spaceRev, hash).
     async fn host(&self) -> BTreeMap<String, (J, J, Vec<u8>)> {
         let a = &self.writers[self.auth];
         let repos = list_repos(a, &self.local, &self.credential).await.unwrap();
         let rows = by_did(&repos);
-        assert_eq!(rows.len(), repos.len(), "listRepos repeats a repo: {repos:?}");
+        assert_eq!(rows.len(), repos.len(), "listWriters repeats a repo: {repos:?}");
         rows.into_iter()
             .map(|(d, r)| (d, (r["repoRev"].clone(), r["spaceRev"].clone(), bytes_field(&r["data"]))))
             .collect()
@@ -272,18 +270,18 @@ impl World {
     async fn check(&self, want: Option<&Snapshot>, ctx: &str) -> Snapshot {
         let rows = quiet_rows(&self.refs()).await;
         let fams = family_counts(&rows);
-        for f in ["sH/", "sR/", "sO/", "sP/", "sS/", "sM/", "sW/", "sQ/", "sN/"] {
+        for f in ["sH/", "sR/", "sO/", "sP/", "sS/", "sM/", "sW/", "sQ/", "sG/"] {
             assert!(fams.get(f).is_some_and(|n| *n > 0), "{ctx}: no {f} rows: {fams:?}");
         }
         let views = self.views(ctx).await;
         let host = self.host().await;
-        assert_eq!(host.len(), self.writers.len(), "{ctx}: listRepos {host:?}");
+        assert_eq!(host.len(), self.writers.len(), "{ctx}: listWriters {host:?}");
         if let Some(w) = want {
             assert_same_rows(&w.rows, &rows, ctx);
             for (k, v) in &w.views {
                 assert_eq!(views.get(k), Some(v), "{ctx}: {k:?} reads differently");
             }
-            assert_eq!(host, w.host, "{ctx}: the authority's listRepos changed");
+            assert_eq!(host, w.host, "{ctx}: the authority's listWriters changed");
         }
         eprintln!("{ctx}: {fams:?}");
         Snapshot { rows, views, host }
@@ -338,7 +336,7 @@ async fn split_and_merge_keep_every_space_row() {
             assert!(head.rev > was.rev, "{} in {space}: rev {} after {}", wr.did, head.rev, was.rev);
             if space == w.local {
                 let (rr, sr, hash) = &host[&wr.did];
-                assert_eq!((rr, hash), (&json!(head.rev), &head.data.to_vec()), "{}: listRepos lags", wr.did);
+                assert_eq!((rr, hash), (&json!(head.rev), &head.data.to_vec()), "{}: listWriters lags", wr.did);
                 assert!(sr.as_str() > before.host[&wr.did].1.as_str(), "{}: spaceRev didn't move", wr.did);
             }
         }

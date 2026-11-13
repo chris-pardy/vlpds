@@ -137,9 +137,8 @@ async function main() {
       await putMember(S.A, S.space, S.W, true, true)
       await putMember(S.A, S.space, S.R, true, false)
       for (let i = 0; i < 50; i++) await S.W.client.com.atproto.space.createRecord({ space: S.space, repo: S.W.did, collection: COLL, rkey: `seed${i}`, record: rec(i) })
-      S.cred = await credentialFor(S.R, S.space)
+      S.cred = await credentialFor(S.R, S.space, { notify: env.svc.register(S.space) })
       S.wc = await S.cred.macClient(S.W.did)
-      await (await S.cred.hostClient()).com.atproto.space.registerNotify({ space: S.space, service: env.svc.serviceRef })
       check(true, 'space with a writer (50 records) and a registered syncer')
     })
 
@@ -183,7 +182,7 @@ async function main() {
         const t = performance.now()
         const rev = (await S.wc.com.atproto.space.getLatestCommit({ space: S.space, repo: S.W.did })).data.commit.rev
         for (let k = 0; k < 200; k++) {
-          const c = env.svc.calls.slice(before).find((x) => x.body?.repoRev === rev && x.body?.repo === S.W.did)
+          const c = env.svc.calls.slice(before).find((x) => x.body?.update?.repoRev === rev && x.body?.update?.repo === S.W.did)
           if (c) {
             lat.push(c.at - t)
             break
@@ -193,7 +192,7 @@ async function main() {
         await sleep(100)
       }
       rep.metrics.notify = summarize(lat)
-      check(lat.length > 0.95 * Math.min(N, 200), `forwarded notifies arrived (${lat.length})`)
+      check(lat.length > 0.95 * Math.min(N, 200), `notifySpaceUpdate calls arrived (${lat.length})`)
       check(pct(lat, 50) < 100, `notify p50 ${pct(lat, 50)} ms after the write is readable (no linger)`)
     }, { needs: ['setup'] })
 

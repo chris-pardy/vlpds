@@ -18,7 +18,7 @@ use vlsync_store::slots::{slot_of, SlotRange};
 /// Every state family a space write or the space host may put in the log
 /// (plan §2.1, C5's sb/sc blob refs).
 pub(super) const SPACE_FAMILIES: &[&[u8]] =
-    &[b"sH/", b"sR/", b"sO/", b"sP/", b"sS/", b"sW/", b"sQ/", b"sM/", b"sN/", b"sb/", b"sc/"];
+    &[b"sH/", b"sR/", b"sO/", b"sP/", b"sS/", b"sW/", b"sQ/", b"sM/", b"sG/", b"sY/", b"sb/", b"sc/"];
 
 pub(super) const SHARDS: u32 = 4;
 const IDLE: Duration = Duration::from_millis(600);

@@ -348,9 +348,9 @@ limit!(
 
 // Spaces (vlpds additions; the reference limits only space writes, which
 // share the repo-write buckets). Space reads are counted on the repo's
-// owner, getSpaceCredential (a durable jti claim each) and inbound
-// notifyWrite (a durable entry each) on the authority's, and
-// notifyCredentialRevoked (a cluster-wide CAS write each) where it lands.
+// owner, authorizeSpaceSync (a durable jti claim each) and inbound
+// notifyRepoUpdate (a durable entry each) on the authority's, and
+// notifyCredentialsRevoked (a cluster-wide CAS write each) where it lands.
 limit!(
     SPACE_READ_CREDENTIAL,
     37,
@@ -374,17 +374,17 @@ limit!(
     39,
     "space-credential",
     DidPair,
-    "space.getSpaceCredential per account and space authority",
+    "space.authorizeSpaceSync per account and space authority",
     HOUR,
     300
 );
-limit!(SPACE_NOTIFY_IN, 40, "space-notify-in", Did, "space.notifyWrite received, per writer", 5 * MINUTE, 1000);
+limit!(SPACE_NOTIFY_IN, 40, "space-notify-in", Did, "space.notifyRepoUpdate received, per writer", 5 * MINUTE, 1000);
 limit!(
     SPACE_REVOKE,
     41,
     "space-revoke",
     Did,
-    "credentials newly revoked by space.notifyCredentialRevoked, per space authority",
+    "credentials newly revoked by space.notifyCredentialsRevoked, per space authority",
     HOUR,
     1000
 );
@@ -395,12 +395,20 @@ limit!(
     43,
     "space-revoke-aud",
     Did,
-    "credentials newly revoked by space.notifyCredentialRevoked, per account here giving the stake",
+    "credentials newly revoked by space.notifyCredentialsRevoked, per account here giving the stake",
     HOUR,
     2000
 );
 limit!(SPACE_CREATE, 44, "space-create", Did, "space.createSpace per account", DAY, 100);
-limit!(SPACE_REGISTER, 45, "space-register", Credential, "space.registerNotify with one space credential", HOUR, 60);
+limit!(
+    SPACE_REGISTER,
+    45,
+    "space-register",
+    Credential,
+    "space.authorizeSpaceSync's new notify registrations (a confirmRegistration call each), per space and endpoint host",
+    HOUR,
+    60
+);
 
 limit!(
     FEDERATED_LINK_ACCOUNT,

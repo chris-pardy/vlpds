@@ -1,13 +1,15 @@
-//! The space host's calls out (reference `space-policy/manager.ts` and
-//! `api/com/atproto/space/util.ts`): resolving a service identifier,
-//! asking a managing app whether a user may read or write, forwarding a
-//! sequenced write to a registered service, and telling registered services
-//! a space is gone. Every call goes through the SSRF-guarded client with
-//! service auth from the authority (`aud` = the service identifier as
-//! published), a 10 s timeout and a small response cap.
+//! The space host's calls out (reference `space-policy/manager.ts`,
+//! `api/com/atproto/space/util.ts` and `authorizeSpaceSync.ts`): resolving
+//! a service identifier, asking a managing app what an account may read
+//! and write, confirming a syncer's new registration, and sending a
+//! registered syncer a sequenced writer-set update. Every call goes through
+//! the SSRF-guarded client (an endpoint is chosen by whoever registered or
+//! published it), with a 10 s timeout and a small response cap; a managing
+//! app gets service auth from the authority (`aud` = the service identifier
+//! as published), a syncer the registration's token in the body instead.
 
-use super::rows::NotifyRow;
-use crate::state::{self, SpaceId};
+use super::rows::RegistrationRow;
+use crate::state::{self, RegId, SpaceId};
 use crate::xrpc::App;
 use serde_json::{json, Value as J};
 use std::time::Duration;
@@ -15,12 +17,10 @@ use vlatproto::tid::Tid;
 
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_RESPONSE: usize = 64 << 10;
-/// Endpoints are kept in `sN` rows (u16-length strings).
-const MAX_ENDPOINT: usize = 2048;
-
-/// How long a notify registration lasts (the reference's
-/// `REGISTRATION_TTL_MS`).
-pub const REGISTRATION_TTL: Duration = Duration::from_secs(24 * 3600);
+/// Endpoints are kept in `sG` rows (u16-length strings).
+pub const MAX_ENDPOINT: usize = 2048;
+/// A registration's token (the lexicon's `maxLength`).
+pub const MAX_TOKEN: usize = 512;
 
 /// Reference `resolveServiceEndpoint`: `did#fragment` names that service
 /// entry; a bare DID its PDS.
@@ -76,10 +76,26 @@ pub(crate) async fn call(
     if let Some(b) = body {
         rb = rb.json(b);
     }
-    let mut r = rb.send().await.map_err(|e| http_error(&url, e))?;
+    answer(&url, rb).await
+}
+
+/// A procedure call to a syncer's registered endpoint: no auth header (the
+/// body carries the registration's token).
+pub(crate) async fn post_endpoint(
+    client: vlatproto::http::Guarded,
+    endpoint: &str,
+    lxm: &str,
+    body: &J,
+) -> Result<(u16, J), String> {
+    let url = format!("{}/xrpc/{lxm}", endpoint.trim_end_matches('/'));
+    answer(&url, client.request(reqwest::Method::POST, &url)?.timeout(CALL_TIMEOUT).json(body)).await
+}
+
+async fn answer(url: &str, rb: reqwest::RequestBuilder) -> Result<(u16, J), String> {
+    let mut r = rb.send().await.map_err(|e| http_error(url, e))?;
     let status = r.status().as_u16();
     let mut buf = Vec::new();
-    while let Some(c) = r.chunk().await.map_err(|e| http_error(&url, e))? {
+    while let Some(c) = r.chunk().await.map_err(|e| http_error(url, e))? {
         if buf.len() + c.len() > MAX_RESPONSE {
             return Err(format!("{url}: response too large"));
         }
@@ -88,61 +104,83 @@ pub(crate) async fn call(
     Ok((status, serde_json::from_slice(&buf).unwrap_or(J::Null)))
 }
 
-/// Reference `checkManagingApp`: the managing app's answer, and a denial
-/// whenever it can't be had (unresolvable, unreachable, any error), since
-/// failing open would hand credentials out for the spaces that asked for
-/// the strictest gate.
-pub async fn check_user_access(
+/// A managing app's answer, as the reference's `checkAccess` asks it:
+/// `repo` absent for a read with no delegation token, `clientId` only on
+/// reads (a write notify doesn't say which app wrote). An app that can't
+/// be had (unresolvable, unreachable, an error, a malformed answer) is
+/// None, not a denial (reference c60bff387): failing open would hand out
+/// credentials for the spaces that asked for the strictest gate, and a
+/// denial would read as a loss of access (a syncer's registration dropped,
+/// a writer's notify not retried).
+pub async fn check_access(
     app: &App,
     space: &str,
     authority: &str,
     managing_app: &str,
-    user: &str,
-    access: &str,
+    repo: Option<&str>,
     client_id: Option<&str>,
-) -> bool {
-    let lxm = "com.atproto.managedspace.checkUserAccess";
+) -> Option<Access> {
+    let lxm = "com.atproto.managedspace.checkAccess";
+    let log_id = crate::state::space_log_id(space);
     let Some(endpoint) = resolve_service_endpoint(app, managing_app).await else {
-        tracing::info!(space = %crate::state::space_log_id(space), managing_app, "could not resolve managing app");
-        return false;
+        tracing::info!(space = %log_id, managing_app, "could not resolve managing app");
+        return None;
     };
-    let mut q = vec![("space", space), ("user", user), ("access", access)];
-    // the attested client is the managing app's to judge, on reads only
-    if let Some(c) = client_id.filter(|_| access == "read") {
+    let mut q = vec![("space", space)];
+    if let Some(r) = repo {
+        q.push(("repo", r));
+    }
+    if let Some(c) = client_id {
         q.push(("clientId", c));
     }
     let client = vlatproto::http::guarded(app.config.dev_mode);
     match call(app, client, authority, managing_app, &endpoint, lxm, reqwest::Method::GET, &q, None).await {
-        Ok((200, body)) => body["authorized"] == J::Bool(true),
+        Ok((200, body)) => match (body["read"].as_bool(), body["write"].as_bool()) {
+            (Some(read), Some(write)) => Some(Access { read, write }),
+            _ => {
+                tracing::info!(space = %log_id, managing_app, "managing app check answered without read and write");
+                None
+            }
+        },
         Ok((status, _)) => {
-            tracing::info!(space = %crate::state::space_log_id(space), managing_app, status, "managing app check failed");
-            false
+            tracing::info!(space = %log_id, managing_app, status, "managing app check failed");
+            None
         }
         Err(e) => {
-            tracing::info!(space = %crate::state::space_log_id(space), managing_app, "managing app check failed: {e}");
-            false
+            tracing::info!(space = %log_id, managing_app, "managing app check failed: {e}");
+            None
         }
     }
 }
 
-/// Live notify registrations a space may hold.
+/// A managing app's verdict on one account.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Access {
+    pub read: bool,
+    pub write: bool,
+}
+
+/// Notify registrations a space may hold, lapsed ones included: past it a
+/// new one takes the place of the lapsed registration that expired
+/// longest ago, and is refused when none has lapsed.
 pub const MAX_REGISTRATIONS: usize = 256;
-/// A registered service identifier (a DID and an optional fragment).
-pub const MAX_SERVICE_LEN: usize = 512;
 
 /// Live notify registrations across one authority's spaces: each space's
 /// cap alone would let one account's spaces register without end.
 pub const MAX_REGISTRATIONS_PER_AUTHORITY: usize = 1024;
 
+pub const CONFIRM_REGISTRATION: &str = "com.atproto.space.confirmRegistration";
+pub const NOTIFY_SPACE_UPDATE: &str = "com.atproto.space.notifySpaceUpdate";
+
 /// Live registrations across `authority`'s spaces, counted up to `stop_at`.
 pub async fn authority_registrations(app: &App, authority: &str, stop_at: usize) -> anyhow::Result<usize> {
     let p = app.partition(authority).map_err(|e| anyhow::anyhow!("{}", e.message))?;
-    let prefix = state::space_did_prefix(state::SPACE_NOTIFY_FAMILY, authority);
+    let prefix = state::space_did_prefix(state::SPACE_REGISTRATION_FAMILY, authority);
     let mut it = p.db.scan(prefix.clone()..vlsync_store::keys::prefix_end(&prefix)).await?;
     let now = vlatproto::tid::now_micros();
     let mut n = 0;
     while let Some(kv) = it.next().await? {
-        if NotifyRow::decode(&kv.value)?.expires > now {
+        if !RegistrationRow::decode(&kv.value)?.lapsed(now) {
             n += 1;
             if n >= stop_at {
                 break;
@@ -152,39 +190,93 @@ pub async fn authority_registrations(app: &App, authority: &str, stop_at: usize)
     Ok(n)
 }
 
-/// A space's registrations (`sN`) from the authority's shard: the live
-/// ones, and the services of expired ones.
-pub async fn registrations(
-    app: &App,
-    authority: &str,
-    sid: &SpaceId,
-) -> anyhow::Result<(Vec<(String, NotifyRow)>, Vec<String>)> {
+/// A space's registrations (`sG`) from the authority's shard, lapsed ones
+/// included.
+pub async fn registrations(app: &App, authority: &str, sid: &SpaceId) -> anyhow::Result<Vec<RegistrationRow>> {
     let p = app.partition(authority).map_err(|e| anyhow::anyhow!("{}", e.message))?;
-    let prefix = state::space_prefix(state::SPACE_NOTIFY_FAMILY, authority, sid);
+    let prefix = state::space_prefix(state::SPACE_REGISTRATION_FAMILY, authority, sid);
     let opts = slatedb::config::ScanOptions::default();
     let mut it = p.db.scan_with_options(prefix.clone()..vlsync_store::keys::prefix_end(&prefix), &opts).await?;
-    let now = vlatproto::tid::now_micros();
-    let (mut live, mut expired) = (Vec::new(), Vec::new());
+    let mut out = Vec::new();
     while let Some(kv) = it.next().await? {
-        let service = std::str::from_utf8(&kv.key[prefix.len()..])?.to_string();
-        let row = NotifyRow::decode(&kv.value)?;
-        match row.expires > now {
-            true => live.push((service, row)),
-            false => expired.push(service),
-        }
+        out.push(RegistrationRow::decode(&kv.value)?);
     }
-    Ok((live, expired))
+    Ok(out)
 }
 
-/// One forward of a sequenced write to a registered service.
+/// Reference `confirmRegistration`: before a new registration, the
+/// endpoint must take the token as one it issued for the space and echo
+/// back a random challenge. Ok(false): it didn't (anything else, an error
+/// included, answers RegistrationNotConfirmed).
+pub async fn confirm_registration(app: &App, space: &str, endpoint: &str, token: &str) -> bool {
+    use base64::Engine;
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(rand::random::<[u8; 16]>());
+    let body = json!({"space": space, "token": token, "challenge": challenge});
+    let client = vlatproto::http::guarded(app.config.dev_mode);
+    let log_id = state::space_log_id(space);
+    match post_endpoint(client, endpoint, CONFIRM_REGISTRATION, &body).await {
+        Ok((200, b)) if b["challenge"].as_str() == Some(challenge.as_str()) => true,
+        Ok((status, _)) => {
+            tracing::info!(space = %log_id, status, "registration not confirmed");
+            false
+        }
+        Err(e) => {
+            tracing::info!(space = %log_id, "registration not confirmed: {e}");
+            false
+        }
+    }
+}
+
+/// A sequenced change to a writer's place in the set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriterUpdate {
+    /// `defs#repoWrite`: the repo at a new rev.
+    Write { repo_rev: Tid, hash: [u8; 32] },
+    /// `defs#repoRemoved`: out of the writer set.
+    Removed,
+}
+
+impl WriterUpdate {
+    /// What a writer's `sW` row reports.
+    pub fn of(w: &super::rows::WriterRow) -> WriterUpdate {
+        match w.removed {
+            true => WriterUpdate::Removed,
+            false => WriterUpdate::Write { repo_rev: w.repo_rev, hash: w.hash },
+        }
+    }
+
+    /// As listWriters and notifySpaceUpdate carry it.
+    pub fn to_json(&self, writer: &str, space_rev: Tid, prev: Option<Tid>) -> J {
+        let mut u = match self {
+            WriterUpdate::Write { repo_rev, hash } => json!({
+                "$type": "com.atproto.space.defs#repoWrite",
+                "repo": writer,
+                "repoRev": repo_rev.to_string(),
+                "data": b64(hash),
+                "spaceRev": space_rev.to_string(),
+            }),
+            WriterUpdate::Removed => json!({
+                "$type": "com.atproto.space.defs#repoRemoved",
+                "repo": writer,
+                "spaceRev": space_rev.to_string(),
+            }),
+        };
+        if let Some(p) = prev {
+            u["prevSpaceRev"] = json!(p.to_string());
+        }
+        u
+    }
+}
+
+/// One forward of a sequenced writer-set update to a registration.
 pub struct Forward {
     pub authority: std::sync::Arc<str>,
     pub uri: std::sync::Arc<str>,
-    pub service: String,
+    pub reg: RegId,
     pub endpoint: String,
+    pub token: String,
     pub writer: String,
-    pub repo_rev: Tid,
-    pub hash: [u8; 32],
+    pub update: WriterUpdate,
     pub space_rev: Tid,
     pub prev_space_rev: Option<Tid>,
     /// The registration's expiry (unix µs).
@@ -196,35 +288,31 @@ fn b64(b: &[u8]) -> J {
     json!({"$bytes": base64::engine::general_purpose::STANDARD_NO_PAD.encode(b)})
 }
 
-/// notifyWrite to a registered service, as the reference forwards it (the
-/// writer's notify plus the spaceRevs), naming `prev` as the spaceRev
-/// before it: "ok", "refused" (a status not worth retrying) or "error".
+/// notifySpaceUpdate to a registration, naming `prev` as the spaceRev
+/// before it: "ok", "refused" (a status not worth retrying) or "error". A
+/// refused update leaves the registration as it is (reference "keeps an
+/// active registration through a rejected update").
 pub async fn forward(app: &App, f: &Forward, prev: Option<Tid>) -> &'static str {
-    let lxm = "com.atproto.space.notifyWrite";
-    let mut body = json!({
+    let body = json!({
         "space": &*f.uri,
-        "repo": f.writer,
-        "repoRev": f.repo_rev.to_string(),
-        "data": b64(&f.hash),
-        "spaceRev": f.space_rev.to_string(),
+        "token": f.token,
+        "update": f.update.to_json(&f.writer, f.space_rev, prev),
     });
-    if let Some(p) = prev {
-        body["prevSpaceRev"] = json!(p.to_string());
-    }
     let client = vlatproto::http::guarded_fanout(app.config.dev_mode);
-    let post = reqwest::Method::POST;
-    match call(app, client, &f.authority, &f.service, &f.endpoint, lxm, post, &[], Some(&body)).await {
+    let log_id = crate::state::space_log_id(&f.uri);
+    let reg = hex::encode(f.reg);
+    match post_endpoint(client, &f.endpoint, NOTIFY_SPACE_UPDATE, &body).await {
         Ok((s, _)) if (200..300).contains(&s) => "ok",
         Ok((s, _)) if crate::xrpc::space::retryable_status(s) => {
-            tracing::info!(space = %crate::state::space_log_id(&f.uri), service = f.service, status = s, "space notify forward failed");
+            tracing::info!(space = %log_id, reg, status = s, "space notify forward failed");
             "error"
         }
         Ok((s, _)) => {
-            tracing::info!(space = %crate::state::space_log_id(&f.uri), service = f.service, status = s, "space notify forward refused");
+            tracing::info!(space = %log_id, reg, status = s, "space notify forward refused");
             "refused"
         }
         Err(e) => {
-            tracing::info!(space = %crate::state::space_log_id(&f.uri), service = f.service, "space notify forward failed: {e}");
+            tracing::info!(space = %log_id, reg, "space notify forward failed: {e}");
             "error"
         }
     }
@@ -312,7 +400,7 @@ async fn served_commit(
     let mut req = vlatproto::http::guarded(app.config.dev_mode)
         .request(reqwest::Method::GET, &url)?
         .query(&[("space", space), ("repo", writer)])
-        .header(super::mac::WANT_MAC_HEADER, super::mac::format_want_mac(super::mac::MacType::Repo, &share));
+        .header(super::mac::ACCEPT_SIGNATURE, super::mac::format_request(super::mac::Profile::Commit, &share));
     for (k, v) in signed {
         req = req.header(k, v);
     }
@@ -320,7 +408,7 @@ async fn served_commit(
     if !r.status().is_success() {
         return Err(format!("getLatestCommit: {}", r.status()));
     }
-    let mac = r.headers().get(super::mac::MAC_HEADER).and_then(|v| v.to_str().ok()).map(String::from);
+    let headers = r.headers().clone();
     let mut buf = Vec::new();
     while let Some(c) = r.chunk().await.map_err(|e| http_error("getLatestCommit", e))? {
         if buf.len() + c.len() > MAX_RESPONSE {
@@ -330,10 +418,7 @@ async fn served_commit(
     }
     let body: J = serde_json::from_slice(&buf).map_err(|_| "getLatestCommit: not JSON")?;
     let commit = super::commit::Commit::from_json(&body["commit"]).ok_or("getLatestCommit: malformed commit")?;
-    let mac = super::mac::parse_mac(mac.as_deref(), super::mac::MacType::Repo).map_err(|e| e.0.to_string())?;
-    if !super::commit::verify(&commit, space, writer, &secret, &mac) {
-        return Err(MAC_MISMATCH.into());
-    }
+    super::commit::verify(&commit, space, writer, &share, &secret, &headers).map_err(|_| MAC_MISMATCH.to_string())?;
     Ok(commit)
 }
 

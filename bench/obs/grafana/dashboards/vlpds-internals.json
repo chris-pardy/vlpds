@@ -8367,7 +8367,7 @@
      "type": "timeseries",
      "id": 100,
      "title": "Write \u2192 notify ack",
-     "description": "A space write's ack to its authority's 200 for the notifyWrite. Writes into the author's own space carry the authority's rows in the write's entry, so they send nothing and aren't counted here.",
+     "description": "A space write's ack to its authority's 200 for the notifyRepoUpdate. Writes into the author's own space carry the authority's rows in the write's entry, so they send nothing and aren't counted here.",
      "datasource": {
       "type": "prometheus",
       "uid": "${ds_prometheus}"
@@ -8468,7 +8468,7 @@
     {
      "type": "timeseries",
      "id": 101,
-     "title": "notifyWrite outbox rows by node",
+     "title": "notifyRepoUpdate outbox rows by node",
      "description": "One row per (repo, space) this node still owes its authority a notify for. Writes made while a send is in flight only move their row's rev, so the count follows the active (repo, space) pairs, not the write rate.",
      "datasource": {
       "type": "prometheus",
@@ -8529,7 +8529,7 @@
     {
      "type": "timeseries",
      "id": 102,
-     "title": "notifyWrite outbox oldest row",
+     "title": "notifyRepoUpdate outbox oldest row",
      "description": "Age of each node's oldest undelivered row. Retries back off from 1 min to 1 h and give up 24 h after the write. Dashed: [VlpdsSpaceOutboxBacklog](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsspaceoutboxbacklog) (1 h).",
      "datasource": {
       "type": "prometheus",
@@ -8606,8 +8606,8 @@
     {
      "type": "timeseries",
      "id": 103,
-     "title": "notifyWrite by hop and result",
-     "description": "out = this node's writes to their authorities; in = notifies received as an authority; fanout = forwarded to registered syncers. ok = 200; retry = backing off; wait = the writer's account is inactive; refused / gone / expired = the row was dropped. in same_rev_unverified / same_rev_capped = a remote writer's same-rev, new-data notify (a record takedown) its host didn't confirm, or over 3 per writer and space in 10 min: dropped, left to polls.",
+     "title": "Space notifies by hop and result",
+     "description": "out = notifyRepoUpdate for this node's writes to their authorities; in = notifyRepoUpdate received as an authority; fanout = notifySpaceUpdate updates (repoWrite, repoRemoved) forwarded to registered syncers; notice = spaceDeleted and registrationExpired notices on their first send (retries of failed ones aren't counted). ok = 200; retry = backing off; wait = the writer's account is inactive; refused / gone / expired = the row was dropped. in same_rev_unverified / same_rev_capped = a remote writer's same-rev, new-hash notify (a record takedown) its host didn't confirm, or over 3 per writer and space in 10 min: dropped, left to polls.",
      "datasource": {
       "type": "prometheus",
       "uid": "${ds_prometheus}"
@@ -8667,7 +8667,7 @@
     {
      "type": "timeseries",
      "id": 104,
-     "title": "notifyWrite failure ratio by hop",
+     "title": "Space notify failure ratio by hop",
      "description": "Dashed: [VlpdsSpaceNotifyFanoutFailing](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsspacenotifyfanoutfailing) (fanout over 50%). A dead syncer or a remote authority that's down shows up here first.",
      "datasource": {
       "type": "prometheus",
@@ -8807,7 +8807,7 @@
      "type": "timeseries",
      "id": 106,
      "title": "listRepoOps server time",
-     "description": "Handler time after auth, the commit's MAC (a KEM decapsulation and an HMAC) included. Targets: noop well under 1 ms, a typical delta a few ms.",
+     "description": "Handler time after auth, the commit and its MAC included. Targets: noop well under 1 ms, a typical delta a few ms.",
      "datasource": {
       "type": "prometheus",
       "uid": "${ds_prometheus}"
@@ -8878,7 +8878,7 @@
      "type": "timeseries",
      "id": 107,
      "title": "Space reads by method and auth",
-     "description": "credential = an Atproto-Space credential (another member or a syncer). oauth = the account reading its own repo.",
+     "description": "credential = an Atproto-Space-Credential (another member or a syncer). oauth = the account reading its own repo.",
      "datasource": {
       "type": "prometheus",
       "uid": "${ds_prometheus}"
@@ -9062,7 +9062,7 @@
      "type": "timeseries",
      "id": 110,
      "title": "Credentials and delegations issued",
-     "description": "getSpaceCredential answers as an authority (bad_token = the delegation token didn't verify), and delegation tokens minted for this node's accounts.",
+     "description": "authorizeSpaceSync answers as an authority (bad_token = the delegation token didn't verify), and delegation tokens minted for this node's accounts.",
      "datasource": {
       "type": "prometheus",
       "uid": "${ds_prometheus}"
@@ -9133,7 +9133,7 @@
      "type": "timeseries",
      "id": 111,
      "title": "Fan-out queue depth and drops",
-     "description": "Notifies waiting for a syncer, and the ones dropped (a newer one for the same syncer superseded it, or a host's queue was full). Superseded drops are normal. The syncer pulls from its last rev either way.",
+     "description": "Writer-set updates waiting for a registration's lane, and the ones dropped by reason (a full lane, host or dispatcher queue; retries run out; the registration lapsed while failing; the space taken down). A drop leaves a prevSpaceRev gap, and the syncer catches up with listWriters.",
      "datasource": {
       "type": "prometheus",
       "uid": "${ds_prometheus}"

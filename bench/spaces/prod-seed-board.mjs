@@ -30,7 +30,7 @@ const now = () => new Date().toISOString()
 
 const space = (
   await c.com.atproto.space.createSpace({ spaceType: TYPE, skey: SKEY, policy: { $type: 'com.atproto.memberspace.policy' } })
-).data.uri
+).data.space
 console.log('space', space)
 
 const put = (collection, record, rkey) =>
@@ -48,7 +48,7 @@ await put(C.comment, { subject: q, body: 'A private group feed would be a fun fi
 await put(C.vote, { subject: welcome, direction: 'up', createdAt: now() })
 await put(C.vote, { subject: q, direction: 'up', createdAt: now() })
 
-await c.com.atproto.memberspace.putMember({ space, did: memberDid, read: true, write: true })
+await c.com.atproto.memberspace.putMembers({ space, members: [{ did: memberDid, read: true, write: true }] })
 const members = (await c.com.atproto.memberspace.listMembers({ space })).data.members
 console.log('members', members.map((m) => `${m.did}${m.write ? ' (read+write)' : ' (read)'}`).join(', '))
 const recs = (await c.com.atproto.space.listRecords({ space, repo: did, collection: C.post })).data.records.length

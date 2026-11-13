@@ -1,7 +1,7 @@
 //! `com.atproto.space.*` (`--spaces`; src/space, DESIGN.md "Spaces"): space
 //! record writes through the author's repo worker, reads of space repos by
 //! their owner (OAuth) or a space credential, the credential exchange, and
-//! the notifyWrite outbox's sends.
+//! the notifyRepoUpdate outbox's sends.
 
 use super::authn::{verify_delegation, SpaceAuth};
 use super::extract::RecordBody;
@@ -13,7 +13,7 @@ use crate::oauth::scopes::{SpaceAccess, SpaceTarget};
 use crate::space::commit::Commit;
 use crate::space::heads::DurableSpaceHead;
 use crate::space::lthash::LtHash;
-use crate::space::mac::{self, MacType};
+use crate::space::mac::{self, Profile};
 use crate::space::outbox::{Outcome, Pending};
 use crate::space::repo::{
     PutScopes, SameRev, SpaceAck, SpaceError, SpaceOp, SpaceOutcome, SpaceReq, SpaceWrite, MAX_WRITES,
@@ -40,14 +40,16 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/xrpc/com.atproto.space.getLatestCommit", get(get_latest_commit))
         .route("/xrpc/com.atproto.space.listRepoOps", get(list_repo_ops))
         .route("/xrpc/com.atproto.space.getDelegationToken", get(get_delegation_token))
-        .route("/xrpc/com.atproto.space.getSpaceCredential", post(get_space_credential))
+        .route("/xrpc/com.atproto.space.authorizeSpaceSync", post(authorize_space_sync))
         .route("/xrpc/com.atproto.space.listSpaces", get(list_spaces))
-        .route("/xrpc/com.atproto.space.notifyCredentialRevoked", post(notify_credential_revoked))
+        .route("/xrpc/com.atproto.space.notifyCredentialsRevoked", post(notify_credentials_revoked))
+        // the Nov 5 alpha's name, for space hosts not yet past it
+        .route("/xrpc/com.atproto.space.notifyCredentialRevoked", post(notify_credential_revoked_v0))
         .route("/xrpc/com.atproto.space.getRepo", get(get_repo))
-        .route("/xrpc/com.atproto.space.notifyWrite", post(notify_write))
-        .route("/xrpc/com.atproto.space.listRepos", get(list_repos))
-        .route("/xrpc/com.atproto.space.registerNotify", post(register_notify))
-        .route("/xrpc/com.atproto.space.unregisterNotify", post(unregister_notify))
+        .route("/xrpc/com.atproto.space.notifyRepoUpdate", post(notify_repo_update))
+        // the Nov 5 alpha's name, for repo hosts not yet past it
+        .route("/xrpc/com.atproto.space.notifyWrite", post(notify_write_v0))
+        .route("/xrpc/com.atproto.space.listWriters", get(list_writers))
 }
 
 pub fn internal_routes() -> Router<Arc<App>> {
@@ -57,7 +59,7 @@ pub fn internal_routes() -> Router<Arc<App>> {
         .route("/internal/v1/space/holdsRepo", get(internal_holds_repo))
 }
 
-pub(super) fn spaces(app: &App) -> XResult<&Arc<Spaces>> {
+pub(crate) fn spaces(app: &App) -> XResult<&Arc<Spaces>> {
     app.spaces.as_ref().ok_or_else(|| XrpcError {
         status: StatusCode::NOT_IMPLEMENTED,
         error: "MethodNotImplemented".into(),
@@ -136,7 +138,7 @@ pub(super) async fn submit_space(app: &App, did: &str, space: &Space, op: SpaceO
         r => r.map_err(space_error),
     }?;
     // the authority's own write sequenced its whole set: with records of it
-    // taken down, what it serves (and so listRepos) is the set without them
+    // taken down, what it serves (and so listWriters) is the set without them
     if matches!(ack, SpaceAck::Write { rev: Some(_), .. })
         && did == space.authority
         && !hidden_paths(app, did, &space.sid).await.map_err(after_applied)?.is_empty()
@@ -500,7 +502,7 @@ pub(super) fn takedown_name(sid: &SpaceId, path: &str) -> String {
 
 /// A space's own takedown (a vlpds extension), on its authority's account
 /// beside its records' (`sec/td/space/{sid}`): no credentials, no
-/// listRepos or registrations, and writers' notifies dropped.
+/// listWriters or registrations, and writers' notifies dropped.
 pub(super) fn space_takedown_name(sid: &SpaceId) -> String {
     format!("space/{}", hex::encode(sid))
 }
@@ -713,22 +715,41 @@ fn commit_of(space: &Space, repo: &str, head: &DurableSpaceHead, set: Option<&Lt
     Commit::new(set.unwrap_or(&head.hash), &space.uri, repo, &head.rev.to_string())
 }
 
-/// Reference `getSpaceMacSecret`: the methods that return a commit or a
-/// record MAC it for a space credential, which must send
-/// `Atproto-Space-Want-Mac`; an account reading its own data gets one only
-/// when it asks. The shared secret, from the repo account's KEM key.
-async fn mac_secret(
+/// A requested MAC, and the shared secret to answer it with.
+struct MacParams {
+    req: mac::MacRequest,
+    secret: [u8; 32],
+}
+
+/// Reference `getSpaceMacRequest`: the methods that return a commit or a
+/// record MAC it for a space credential, which must ask with
+/// `Accept-Signature` (tagged with the profile); an account reading its
+/// own data gets one only when it asks. The shared secret is from the repo
+/// account's KEM key.
+async fn mac_request(
     app: &App,
     headers: &HeaderMap,
     creds: &Credentials,
     repo: &str,
-    ty: MacType,
-) -> XResult<Option<[u8; 32]>> {
-    let lines: Vec<&str> = headers.get_all(mac::WANT_MAC_HEADER).iter().filter_map(|v| v.to_str().ok()).collect();
-    let want = (!lines.is_empty()).then(|| lines.join(", "));
-    if want.is_none() && !matches!(creds, Credentials::SpaceCredential { .. }) {
+    p: Profile,
+) -> XResult<Option<MacParams>> {
+    let bad = |e: mac::MacError| XrpcError::bad(mac::MacError::CODE, e.0);
+    let value = match headers.contains_key(mac::ACCEPT_SIGNATURE) {
+        false => None,
+        true => Some(
+            crate::space::httpsig::joined(headers, mac::ACCEPT_SIGNATURE)
+                .ok_or_else(|| bad(mac::MacError("malformed Accept-Signature header".into())))?,
+        ),
+    };
+    let Some(req) = mac::parse_request(value.as_deref(), p).map_err(bad)? else {
+        if matches!(creds, Credentials::SpaceCredential { .. }) {
+            return Err(XrpcError::bad(
+                mac::MacError::CODE,
+                format!("A MAC must be requested with tag \"{}\"", p.name()),
+            ));
+        }
         return Ok(None);
-    }
+    };
     let account = app.account(repo).await?;
     let key = app
         .secrets
@@ -736,29 +757,27 @@ async fn mac_secret(
         .await
         .map_err(|e| XrpcError::internal(format!("kem key of {repo}: {e}")))?
         .ok_or_else(|| XrpcError::internal(format!("Account has no KEM key: {repo}")))?;
-    let bad = |e: mac::MacError| XrpcError::bad(mac::MacError::CODE, e.0);
-    let share = mac::parse_want_mac(want.as_deref(), ty).map_err(bad)?;
-    Ok(Some(mac::decapsulate(&key, &share).map_err(bad)?))
+    let secret = mac::decapsulate(&key, &req.key_share).map_err(bad)?;
+    Ok(Some(MacParams { req, secret }))
 }
 
 /// A MAC-bearing method's response: `Vary` always, and the MAC (readable
 /// cross-origin) when one was asked for.
-fn with_mac(mut r: Response, mac: Option<String>) -> Response {
+fn with_mac(mut r: Response, mac: Option<[(&'static str, String); 3]>) -> Response {
     let h = r.headers_mut();
-    h.append(header::VARY, axum::http::HeaderValue::from_static(mac::WANT_MAC_HEADER));
-    if let Some(m) = mac {
-        h.append(header::ACCESS_CONTROL_EXPOSE_HEADERS, axum::http::HeaderValue::from_static(mac::MAC_HEADER));
-        if let Ok(v) = axum::http::HeaderValue::from_str(&m) {
-            h.insert(mac::MAC_HEADER, v);
+    h.append(header::VARY, axum::http::HeaderValue::from_static("Accept-Signature"));
+    for (name, v) in mac.into_iter().flatten() {
+        h.append(header::ACCESS_CONTROL_EXPOSE_HEADERS, axum::http::HeaderValue::from_static(name));
+        if let Ok(v) = axum::http::HeaderValue::from_str(&v) {
+            h.insert(name, v);
         }
     }
     r
 }
 
-fn commit_mac_header(secret: Option<[u8; 32]>, c: &Commit) -> XResult<Option<String>> {
-    let Some(secret) = secret else { return Ok(None) };
-    let m = crate::space::commit::commit_mac(&secret, c).ok_or_else(|| XrpcError::internal("space commit too long"))?;
-    Ok(Some(mac::format_mac(MacType::Repo, &m)))
+fn commit_mac(mac: &Option<MacParams>, c: &Commit) -> Option<[(&'static str, String); 3]> {
+    let m = mac.as_ref()?;
+    Some(mac::response_headers(Profile::Commit, mac::commit_header(c), &m.req, &m.secret))
 }
 
 #[derive(Deserialize)]
@@ -781,7 +800,7 @@ async fn get_record(
     assert_space_open(&app, &space, self_read).await?;
     check_path(&q.collection, Some(&q.rkey))?;
     available(&app, &q.repo, self_read).await?;
-    let secret = mac_secret(&app, &headers, &creds, &q.repo, MacType::Record).await?;
+    let mac = mac_request(&app, &headers, &creds, &q.repo, Profile::Record).await?;
     metrics::space_read("getRecord", auth_label(&creds));
     let p = app.partition(&q.repo)?;
     let path = format!("{}/{}", q.collection, q.rkey);
@@ -805,14 +824,8 @@ async fn get_record(
     out.extend_from_slice(b"\",\"value\":");
     vlatproto::cbor::write_json(bytes, &mut out).map_err(XrpcError::from_err)?;
     out.push(b'}');
-    let mac = match secret {
-        Some(secret) => {
-            let m = crate::space::commit::record_mac(&secret, &uri, &cid.to_bytes())
-                .ok_or_else(|| XrpcError::internal("space record uri too long"))?;
-            Some(mac::format_mac(MacType::Record, &m))
-        }
-        None => None,
-    };
+    let mac = mac
+        .map(|m| mac::response_headers(Profile::Record, mac::record_header(&uri, &cid.to_string()), &m.req, &m.secret));
     Ok(with_mac(json_bytes(out), mac))
 }
 
@@ -824,7 +837,6 @@ struct ListRecordsQ {
     collection: Option<String>,
     limit: Option<i64>,
     cursor: Option<String>,
-    reverse: Option<bool>,
     exclude_values: Option<bool>,
 }
 
@@ -834,8 +846,8 @@ struct ListRecordsQ {
 const PAGE_BYTES: usize = 4 << 20;
 const PAGE_BATCH: usize = 32;
 
-/// Newest path first unless `reverse`, as the reference orders by URI; the
-/// cursor is the last record's URI.
+/// Newest path first, as the reference orders by URI (it dropped `reverse`
+/// in the Nov 12 alpha); the cursor is the last record's URI.
 async fn list_records(
     State(app): AppState,
     SpaceAuth(creds): SpaceAuth,
@@ -849,6 +861,12 @@ async fn list_records(
         check_path(c, None)?;
     }
     let limit = super::extract::limit_param(q.limit, 50, 1, 1000)?;
+    if q.cursor
+        .as_deref()
+        .is_some_and(|c| !crate::lexicon::valid_at_uri(c) && crate::lexicon::space_at_uri(c).is_none())
+    {
+        return Err(super::space_policy::invalid_cursor());
+    }
     available(&app, &q.repo, self_read).await?;
     metrics::space_read("listRecords", auth_label(&creds));
     let p = app.partition(&q.repo)?;
@@ -864,19 +882,16 @@ async fn list_records(
         None => base.clone(),
     };
     let end = vlsync_store::keys::prefix_end(&prefix);
-    let ascending = q.reverse.unwrap_or(false);
     let after = q.cursor.as_deref().and_then(|c| c.strip_prefix(&space.record_uri(&q.repo, "")));
-    let (lo, hi) = match (after, ascending) {
-        (Some(c), true) => ([&base[..], c.as_bytes(), &[0]].concat().max(prefix.clone()), end),
-        (Some(c), false) => (prefix.clone(), [&base[..], c.as_bytes()].concat().min(end)),
-        (None, _) => (prefix.clone(), end),
+    let (lo, hi) = match after {
+        Some(c) => (prefix.clone(), [&base[..], c.as_bytes()].concat().min(end)),
+        None => (prefix.clone(), end),
     };
     if lo >= hi {
         out.extend_from_slice(b"]}");
         return Ok(json_bytes(out));
     }
-    let order = if ascending { slatedb::IterationOrder::Ascending } else { slatedb::IterationOrder::Descending };
-    let opts = slatedb::config::ScanOptions::default().with_order(order);
+    let opts = slatedb::config::ScanOptions::default().with_order(slatedb::IterationOrder::Descending);
     let takedowns = super::server::ctl(&app, &q.repo).await?;
     let mut iter = p.db.scan_with_options(lo..hi, &opts).await.map_err(XrpcError::from_err)?;
     let (mut n, mut last, mut full) = (0, None, false);
@@ -979,14 +994,13 @@ async fn get_blob(State(app): AppState, SpaceAuth(creds): SpaceAuth, Query(q): Q
 struct ListBlobsQ {
     space: String,
     repo: String,
-    since: Option<String>,
     limit: Option<i64>,
     cursor: Option<String>,
 }
 
 /// Reference space.listBlobs: the distinct blobs this repo's records in
-/// this space name, in CID order; with `since`, those named by a record
-/// written after that rev. Only a full page has a cursor.
+/// this space name, in CID order (the Nov 12 alpha dropped `since`). Only a
+/// full page has a cursor.
 async fn list_blobs(
     State(app): AppState,
     SpaceAuth(creds): SpaceAuth,
@@ -996,10 +1010,6 @@ async fn list_blobs(
     let space = Space::parse(&q.space)?;
     let self_read = assert_space_read(&creds, &space, &q.repo)?;
     assert_space_open(&app, &space, self_read).await?;
-    let since = match q.since.as_deref() {
-        Some(s) => Some(Tid::parse(s).ok_or_else(|| XrpcError::bad("InvalidRequest", "since must be a TID"))?),
-        None => None,
-    };
     let limit = super::extract::limit_param(q.limit, 500, 1, 1000)?;
     available(&app, &q.repo, self_read).await?;
     metrics::space_read("listBlobs", auth_label(&creds));
@@ -1030,9 +1040,6 @@ async fn list_blobs(
             let (cid, path) = crate::space::rows::blob_ref_parts(&kv.key[prefix.len()..])
                 .ok_or_else(|| XrpcError::internal("bad space blob ref key"))?;
             if cids.last().is_some_and(|c| c == cid) {
-                continue;
-            }
-            if since.is_some_and(|s| crate::space::rows::blob_ref_rev(&kv.value) <= s) {
                 continue;
             }
             if hidden.iter().any(|h| h == path) {
@@ -1068,15 +1075,14 @@ async fn get_latest_commit(
     let self_read = assert_space_read(&creds, &space, &q.repo)?;
     assert_space_open(&app, &space, self_read).await?;
     available(&app, &q.repo, self_read).await?;
-    let secret = mac_secret(&app, &headers, &creds, &q.repo, MacType::Repo).await?;
+    let mac = mac_request(&app, &headers, &creds, &q.repo, Profile::Commit).await?;
     metrics::space_read("getLatestCommit", auth_label(&creds));
     let p = app.partition(&q.repo)?;
     let (head, set) = served_head(&app, sp, &p, &q.repo, &space)
         .await?
         .ok_or_else(|| XrpcError::bad("RepoNotFound", format!("Could not find repo for space: {}", space.uri)))?;
     let c = commit_of(&space, &q.repo, &head, set.as_ref());
-    let mac = commit_mac_header(secret, &c)?;
-    Ok(with_mac(Json(json!({"commit": c.to_json()})).into_response(), mac))
+    Ok(with_mac(Json(json!({"commit": c.to_json()})).into_response(), commit_mac(&mac, &c)))
 }
 
 #[derive(Deserialize)]
@@ -1093,15 +1099,15 @@ struct ListRepoOpsQ {
 /// `{rev}/{idx}`. The reference compares the rev as a string; a TID's
 /// string order is its numeric order, and anything else can't be a rev.
 fn parse_cursor(c: &str) -> XResult<(Tid, u16)> {
-    let malformed = || XrpcError::bad("MalformedCursor", "Malformed cursor");
+    let malformed = || XrpcError::bad("InvalidCursor", "Malformed cursor");
     let (rev, idx) = c.split_once('/').ok_or_else(malformed)?;
     Ok((Tid::parse(rev).ok_or_else(malformed)?, idx.parse().map_err(|_| malformed())?))
 }
 
 /// Ops after `since` (or the cursor), each with the record's current value
-/// when it is still the op's (a superseded one is left off). A page that
-/// reaches the head carries the signed commit; a full one, a cursor
-/// instead. `since` at (or past) the head is answered from memory.
+/// when it is still the op's (a superseded one is left off). Every page
+/// carries the repo's current commit (and so a MAC); a full one, a cursor
+/// too. `since` at (or past) the head is answered from memory.
 async fn list_repo_ops(
     State(app): AppState,
     SpaceAuth(creds): SpaceAuth,
@@ -1119,36 +1125,26 @@ async fn list_repo_ops(
     let limit = super::extract::limit_param(q.limit, 100, 1, 1000)?;
     let cursor = q.cursor.as_deref().map(parse_cursor).transpose()?;
     available(&app, &q.repo, self_read).await?;
-    // required on every page, a page without a commit included
-    let secret = mac_secret(&app, &headers, &creds, &q.repo, MacType::Repo).await?;
+    let mac = mac_request(&app, &headers, &creds, &q.repo, Profile::Commit).await?;
     metrics::space_read("listRepoOps", auth_label(&creds));
     let start = Instant::now();
     let p = app.partition(&q.repo)?;
     let hidden = hidden_paths(&app, &q.repo, &space.sid).await?;
+    let not_found = || XrpcError::bad("RepoNotFound", format!("Could not find repo for space: {}", space.uri));
     if hidden.is_empty() {
-        let head = load_head(sp, &p, &q.repo, &space).await?;
-        let caught_up = match (&head, cursor, since) {
-            (None, ..) => true,
-            (Some(h), None, Some(s)) => s >= h.rev,
-            _ => false,
-        };
-        if caught_up {
-            let mut out = json!({"ops": []});
-            let mut mac = None;
-            if let Some(h) = &head {
-                let c = commit_of(&space, &q.repo, h, None);
-                mac = commit_mac_header(secret, &c)?;
-                out["commit"] = c.to_json();
-            }
+        let head = load_head(sp, &p, &q.repo, &space).await?.ok_or_else(not_found)?;
+        if cursor.is_none() && since.is_some_and(|s| s >= head.rev) {
+            let c = commit_of(&space, &q.repo, &head, None);
             metrics::space_list_repo_ops("noop", start.elapsed());
-            return Ok(with_mac(Json(out).into_response(), mac));
+            let out = json!({"ops": [], "commit": c.to_json()});
+            return Ok(with_mac(Json(out).into_response(), commit_mac(&mac, &c)));
         }
     }
     // one snapshot: the commit describes exactly the ops' end state
     let snap = p.db.snapshot().map_err(XrpcError::from_err)?;
     let head = match snap.get(state::space_head_key(&q.repo, &space.sid)).await.map_err(XrpcError::from_err)? {
         Some(v) => head_of(HeadRow::decode(&v).map_err(XrpcError::from_err)?, &space, &p)?,
-        None => return Ok(with_mac(Json(json!({"ops": []})).into_response(), None)),
+        None => return Err(not_found()),
     };
     let prefix = state::space_prefix(state::SPACE_OPLOG_FAMILY, &q.repo, &space.sid);
     let after = |rev: u64, idx: u32| -> Vec<u8> {
@@ -1175,9 +1171,9 @@ async fn list_repo_ops(
     let mut ops = Vec::with_capacity(limit.min(256) * 160);
     ops.push(b'[');
     let mut last = None;
-    // a page is `limit` ops scanned, hidden ones included, so the cursor and
-    // whether the page reaches the head don't depend on what's hidden; it
-    // ends early (with a cursor) past PAGE_BYTES
+    // a page is `limit` ops scanned, hidden ones included, so the cursor
+    // doesn't depend on what's hidden; it ends early (with a cursor) past
+    // PAGE_BYTES
     let (mut rows_seen, mut full) = (0, false);
     'page: while rows_seen < limit {
         let rows = iter.next_batch((limit - rows_seen).min(PAGE_BATCH)).await.map_err(XrpcError::from_err)?;
@@ -1227,18 +1223,17 @@ async fn list_repo_ops(
     ops.push(b']');
     let mut out = Vec::with_capacity(ops.len() + 512);
     out.push(b'{');
-    let mut mac = None;
-    if rows_seen < limit && !full {
-        let set = match hidden.is_empty() {
-            true => None,
-            false => Some(served_set(&snap, &q.repo, &space.sid, &head.hash, &hidden).await?),
-        };
-        out.extend_from_slice(b"\"commit\":");
-        let c = commit_of(&space, &q.repo, &head, set.as_ref());
-        mac = commit_mac_header(secret, &c)?;
-        serde_json::to_writer(&mut out, &c.to_json()).map_err(XrpcError::from_err)?;
-        out.push(b',');
-    } else if let Some((rev, idx)) = last {
+    let set = match hidden.is_empty() {
+        true => None,
+        false => Some(served_set(&snap, &q.repo, &space.sid, &head.hash, &hidden).await?),
+    };
+    out.extend_from_slice(b"\"commit\":");
+    let c = commit_of(&space, &q.repo, &head, set.as_ref());
+    serde_json::to_writer(&mut out, &c.to_json()).map_err(XrpcError::from_err)?;
+    out.push(b',');
+    // a full page may not be the last; when it ends on the last op, the
+    // syncer makes one more request
+    if let (true, Some((rev, idx))) = (rows_seen == limit || full, last) {
         out.extend_from_slice(b"\"cursor\":");
         serde_json::to_writer(&mut out, &format!("{rev}/{idx}")).map_err(XrpcError::from_err)?;
         out.push(b',');
@@ -1247,7 +1242,7 @@ async fn list_repo_ops(
     out.extend_from_slice(&ops);
     out.push(b'}');
     metrics::space_list_repo_ops("scan", start.elapsed());
-    Ok(with_mac(json_bytes(out), mac))
+    Ok(with_mac(json_bytes(out), commit_mac(&mac, &c)))
 }
 
 #[derive(Deserialize)]
@@ -1279,17 +1274,50 @@ async fn get_delegation_token(State(app): AppState, Auth(creds): Auth, Query(q):
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct CredentialIn {
+struct AuthorizeIn {
     space: String,
-    credential_kid: String,
+    credential_key: String,
     delegation_token: Option<String>,
     client_attestation: Option<String>,
+    notify: Option<NotifyIn>,
 }
 
-/// At the space's authority (forwarded there by `space`): the delegation
-/// token, when there is one, checked and claimed, then the space's policy.
-/// The credential is bound to `credentialKid`.
-async fn get_space_credential(State(app): AppState, Json(inp): Json<CredentialIn>) -> XResult<Json<J>> {
+#[derive(Deserialize)]
+struct NotifyIn {
+    endpoint: String,
+    token: String,
+}
+
+impl NotifyIn {
+    /// The lexicon's `uri` and `maxLength`, and what an `sG` row holds.
+    fn check(&self) -> XResult<()> {
+        let bad = |m: &str| Err(XrpcError::bad("InvalidRequest", m));
+        let url = reqwest::Url::parse(&self.endpoint).ok();
+        if self.endpoint.len() > crate::space::host::MAX_ENDPOINT
+            || !url.is_some_and(|u| matches!(u.scheme(), "https" | "http") && u.host().is_some())
+        {
+            return bad("Input/notify/endpoint must be an http(s) URL");
+        }
+        if self.token.len() > crate::space::host::MAX_TOKEN {
+            return bad("Input/notify/token must not be longer than 512 characters");
+        }
+        Ok(())
+    }
+}
+
+/// Reference authorizeSpaceSync, at the space's authority (forwarded there
+/// by `space`): a deleted space is SpaceDeleted before anything about the
+/// request is checked; then the delegation token, when there is one,
+/// checked and claimed, then the space's policy. The credential is bound
+/// to `credentialKey`, and the answer carries the space's spaceRev.
+///
+/// `notify` registers its endpoint and token (together, the registration)
+/// for notifySpaceUpdate, active until this credential expires; each
+/// authorization carrying the pair renews it. A new one is confirmed first
+/// with confirmRegistration (else RegistrationNotConfirmed). A refusal by
+/// the policy withdraws the registration the request carries; a failure to
+/// decide (a managing app that didn't answer, UpstreamFailure) leaves it.
+async fn authorize_space_sync(State(app): AppState, Json(inp): Json<AuthorizeIn>) -> XResult<Json<J>> {
     spaces(&app)?;
     let r = issue_credential(&app, inp).await;
     metrics::space_credential_issued(match &r {
@@ -1301,14 +1329,25 @@ async fn get_space_credential(State(app): AppState, Json(inp): Json<CredentialIn
     r
 }
 
-async fn issue_credential(app: &App, inp: CredentialIn) -> XResult<Json<J>> {
-    if crate::space::did_key_alg(&inp.credential_kid) != Some("ES256") {
-        return Err(XrpcError::bad("InvalidRequest", "credentialKid must be a P-256 did:key"));
+async fn issue_credential(app: &App, inp: AuthorizeIn) -> XResult<Json<J>> {
+    if crate::space::did_key_alg(&inp.credential_key) != Some("ES256") {
+        return Err(XrpcError::bad("InvalidRequest", "credentialKey must be a P-256 did:key"));
+    }
+    let space = Space::parse(&inp.space)?;
+    if let Some(n) = &inp.notify {
+        n.check()?;
+    }
+    super::space_policy::assert_space_host(app, &space).await?;
+    // the durable signal that a space is gone, for a syncer that missed
+    // its deletion notice, whatever the request carries: a public space's
+    // syncer may have no delegation token
+    if super::space_policy::space_row_opt(app, &space).await?.is_some_and(|r| !r.live()) {
+        return Err(XrpcError::bad("SpaceDeleted", "Space has been deleted"));
     }
     let user = match &inp.delegation_token {
         Some(t) => {
             let d = verify_delegation(app, t).await?;
-            if d.space != inp.space {
+            if d.space != space.uri {
                 return Err(XrpcError::bad(
                     "InvalidDelegationToken",
                     "Delegation token subject does not match requested space",
@@ -1318,8 +1357,6 @@ async fn issue_credential(app: &App, inp: CredentialIn) -> XResult<Json<J>> {
         }
         None => None,
     };
-    let space = Space::parse(&inp.space)?;
-    super::space_policy::assert_space_host(app, &space).await?;
     let client_id = match &inp.client_attestation {
         Some(a) => {
             let aud = token::space_host_aud(&space.authority);
@@ -1327,19 +1364,59 @@ async fn issue_credential(app: &App, inp: CredentialIn) -> XResult<Json<J>> {
         }
         None => None,
     };
-    let row = super::space_policy::space_row(app, &space).await?;
-    if !row.live() {
-        // the durable signal that a space is gone, for a syncer that missed
-        // notifySpaceDeleted, with or without a delegation token
-        return Err(XrpcError::bad("SpaceDeleted", "Space has been deleted"));
-    }
-    // told only to those it would otherwise admit: a non-member learns
-    // nothing about the space from it
-    let taken_down = space_takendown(app, &space).await?;
-    // vlpds also refuses a taken-down member (the reference admits one)
+    // read again: deleted meanwhile is SpaceNotFound, as the reference's
+    // getActiveSpacePolicy answers it
+    let row = super::space_policy::live_space(app, &space).await?;
     let (key, status) = super::proxy::account_key_status(app, &space.authority).await?;
     authority_suspended(status.as_deref())?;
-    if let Some(user) = user.as_deref().filter(|u| *u != space.authority) {
+    match authorize(app, &space, &row, user.as_deref(), client_id.as_deref()).await {
+        Ok(()) => {}
+        // a syncer that lost access stops being notified; a failure to
+        // decide isn't a refusal
+        Err(e) if !e.status.is_server_error() => {
+            if let Some(n) = &inp.notify {
+                let op = SpaceOp::UnregisterNotify { id: state::reg_id(&n.endpoint, &n.token), lapsed_by: None };
+                if let Err(w) = submit_space(app, &space.authority, &space, op).await {
+                    tracing::warn!(space = %hex::encode(space.sid), "refused registration not withdrawn: {}", w.message);
+                }
+            }
+            return Err(e);
+        }
+        Err(e) => return Err(e),
+    }
+    let now = vlatproto::tid::now_micros() as i64 / 1_000_000;
+    if let Some(n) = &inp.notify {
+        let lifetime = TokenType::Credential.default_lifetime_secs();
+        register(app, &space, n, (now + lifetime) as u64 * 1_000_000).await?;
+    }
+    let mint =
+        token::Mint { iss: &space.authority, sub: &space.uri, key_id: Some(&inp.credential_key), ..Default::default() };
+    let cred = token::encode(TokenType::Credential, &mint, "ES256K", now, &token::new_jti(), |b| {
+        Ok::<_, std::convert::Infallible>(key.sign(b))
+    })
+    .map_err(|e| XrpcError::internal(format!("space credential: {e:?}")))?;
+    let mut out = json!({"credential": cred});
+    // read after registering, so any update past it is notified
+    if let Some(rev) = space_rev(app, &space).await? {
+        out["spaceRev"] = json!(rev.to_string());
+    }
+    Ok(Json(out))
+}
+
+/// Whether the space's policy admits the request (reference
+/// `authorizeCredential`): Err is the refusal (or the failure to decide).
+async fn authorize(
+    app: &App,
+    space: &Space,
+    row: &crate::space::rows::SpaceRow,
+    user: Option<&str>,
+    client_id: Option<&str>,
+) -> XResult<()> {
+    // told only to those it would otherwise admit: a non-member learns
+    // nothing about the space from it
+    let taken_down = space_takendown(app, space).await?;
+    // vlpds also refuses a taken-down member (the reference admits one)
+    if let Some(user) = user.filter(|u| *u != space.authority) {
         match super::internal::account_anywhere(app, user).await {
             Ok(a) if matches!(a.status.as_deref(), Some("takendown" | "suspended")) => {
                 return Err(XrpcError::bad("AccountTakedown", "User account has been taken down"));
@@ -1350,60 +1427,127 @@ async fn issue_credential(app: &App, inp: CredentialIn) -> XResult<Json<J>> {
             Err(e) => return Err(e),
         }
     }
-    // Reference `authorizeCredential`: the user first, and one the policy
-    // refuses is answered as though the space didn't exist, so a refusal
-    // discloses nothing about it. Without a delegation token only a public
-    // read admits. The app perimeter only after that.
-    let user_ok = match &user {
-        Some(user) => {
-            super::space_policy::authorize_user(app, &space, &row, user, "read", client_id.as_deref()).await?
-        }
-        None => row.policy.public_read(),
-    };
-    if !user_ok {
+    // Reference `authorizeCredential`: the account first, and one the
+    // policy refuses is answered as though the space didn't exist, so a
+    // refusal discloses nothing about it. Without a delegation token only
+    // a policy that doesn't gate on the account admits (a managing app is
+    // asked with no `repo`). The app perimeter only after that.
+    let ok = super::space_policy::authorize_repo(app, space, row, user, "read", client_id).await?;
+    if !ok {
         return Err(super::space_policy::space_not_found());
     }
-    if !row.policy.app_authorized(client_id.as_deref()) {
+    if !row.policy.app_authorized(client_id) {
         return Err(XrpcError::bad("AppNotAuthorized", "Application not authorized for this space"));
     }
     if taken_down {
         return Err(XrpcError::bad("NotAuthorized", "Space has been taken down"));
     }
-    let mint =
-        token::Mint { iss: &space.authority, sub: &space.uri, key_id: Some(&inp.credential_kid), ..Default::default() };
-    let now = vlatproto::tid::now_micros() as i64 / 1_000_000;
-    let cred = token::encode(TokenType::Credential, &mint, "ES256K", now, &token::new_jti(), |b| {
-        Ok::<_, std::convert::Infallible>(key.sign(b))
-    })
-    .map_err(|e| XrpcError::internal(format!("space credential: {e:?}")))?;
-    Ok(Json(json!({"credential": cred})))
+    Ok(())
+}
+
+/// authorizeSpaceSync's registration, active until `expires` (unix µs, the
+/// credential's `exp`). A new one is confirmed at its endpoint and counted
+/// against the caps first; a renewal is neither.
+async fn register(app: &App, space: &Space, n: &NotifyIn, expires: u64) -> XResult<()> {
+    use crate::space::host;
+    let sp = spaces(app)?.clone();
+    let id = state::reg_id(&n.endpoint, &n.token);
+    let p = app.partition(&space.authority)?;
+    let held = p.db.get(state::space_registration_key(&space.authority, &space.sid, &id)).await;
+    if held.map_err(XrpcError::from_err)?.is_none() {
+        // each confirmation is a request this host makes to an endpoint
+        // the caller chose
+        let host = reqwest::Url::parse(&n.endpoint).ok().and_then(|u| u.host_str().map(str::to_string));
+        let key = super::authn::private_limit_key(app, &format!("{} {}", space.uri, host.unwrap_or_default()));
+        crate::ratelimit::check(&[&crate::ratelimit::SPACE_REGISTER], &key, 1)?;
+        room(app, &sp, space, &id).await?;
+        if !host::confirm_registration(app, &space.uri, &n.endpoint, &n.token).await {
+            return Err(XrpcError::bad("RegistrationNotConfirmed", "Notify endpoint did not confirm the registration"));
+        }
+    }
+    // every update of the space goes to each registration: counted and made
+    // under the space's lock, so concurrent ones can't pass the caps together
+    let _registering = sp.registering(&space.sid).await;
+    if let Some(evict) = room(app, &sp, space, &id).await? {
+        let op = SpaceOp::UnregisterNotify { id: evict, lapsed_by: Some(vlatproto::tid::now_micros()) };
+        submit_space(app, &space.authority, space, op).await?;
+    }
+    let row = crate::space::rows::RegistrationRow {
+        endpoint: n.endpoint.clone(),
+        token: n.token.clone(),
+        expires,
+        expiry_notified: false,
+    };
+    submit_space(app, &space.authority, space, SpaceOp::RegisterNotify { row }).await?;
+    Ok(())
+}
+
+/// Whether the space has room for registration `id` (held already, or new
+/// under the caps): Ok(Some(lapsed)) when it takes the place of the lapsed
+/// registration that expired longest ago.
+async fn room(app: &App, sp: &Spaces, space: &Space, id: &state::RegId) -> XResult<Option<state::RegId>> {
+    use crate::space::host::{self, MAX_REGISTRATIONS};
+    let regs = host::registrations(app, &space.authority, &space.sid).await.map_err(XrpcError::from_err)?;
+    if regs.iter().any(|r| r.id() == *id) {
+        return Ok(None);
+    }
+    let now = vlatproto::tid::now_micros();
+    let (_, cap) = sp.account_caps();
+    let n = host::authority_registrations(app, &space.authority, cap).await.map_err(XrpcError::from_err)?;
+    if n >= cap {
+        return Err(XrpcError::bad(
+            "InvalidRequest",
+            format!("this space's authority has {cap} notify registrations across its spaces"),
+        ));
+    }
+    if regs.len() < MAX_REGISTRATIONS {
+        return Ok(None);
+    }
+    match regs.iter().filter(|r| r.lapsed(now)).min_by_key(|r| r.expires) {
+        Some(r) => Ok(Some(r.id())),
+        None => Err(XrpcError::bad(
+            "InvalidRequest",
+            format!("this space has {MAX_REGISTRATIONS} active notify registrations"),
+        )),
+    }
+}
+
+/// The space's latest spaceRev (reference `getSpaceRev`), None before its
+/// first update. The newest `sQ` row: the whole space's sequence the same
+/// way the worker reads it, removals included.
+async fn space_rev(app: &App, space: &Space) -> XResult<Option<Tid>> {
+    crate::space::newest_space_rev(app, &space.authority, &space.sid).await.map_err(XrpcError::from_err)
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ListSpacesQ {
     space_type: Option<String>,
-    did: Option<String>,
+    space_did: Option<String>,
     limit: Option<i64>,
     cursor: Option<String>,
 }
 
 /// Reference listSpaces: the spaces the account holds a repo in, plus
 /// those it governs (the reference's `ensureSpace` at createSpace), by
-/// URI. The filters are the scope target, so an unfiltered listing needs
-/// a wildcard grant.
+/// URI, each with the account's repoRev and data there (if it has a repo)
+/// and, for a space it governs, the space's latest spaceRev. The filters
+/// are the scope target, so an unfiltered listing needs a wildcard grant.
 async fn list_spaces(State(app): AppState, Auth(creds): Auth, Query(q): Query<ListSpacesQ>) -> XResult<Json<J>> {
     spaces(&app)?;
     if q.space_type.as_deref().is_some_and(|t| !vlatproto::syntax::valid_nsid(t)) {
         return Err(XrpcError::bad("InvalidRequest", "spaceType must be an NSID"));
     }
-    if q.did.as_deref().is_some_and(|d| !vlatproto::syntax::valid_did(d)) {
-        return Err(XrpcError::bad("InvalidRequest", "did must be a DID"));
+    if q.space_did.as_deref().is_some_and(|d| !vlatproto::syntax::valid_did(d)) {
+        return Err(XrpcError::bad("InvalidRequest", "spaceDid must be a DID"));
     }
     let limit = super::extract::limit_param(q.limit, 50, 1, 100)?;
+    if q.cursor.as_deref().is_some_and(|c| Space::parse(c).is_err()) {
+        return Err(super::space_policy::invalid_cursor());
+    }
     let target = SpaceTarget {
         space_type: q.space_type.as_deref().unwrap_or("*"),
-        authority: q.did.as_deref().unwrap_or("*"),
+        authority: q.space_did.as_deref().unwrap_or("*"),
         skey: "*",
     };
     creds.need_space(&target, SpaceAccess::ReadSelf)?;
@@ -1416,7 +1560,23 @@ async fn list_spaces(State(app): AppState, Auth(creds): Auth, Query(q): Query<Li
         // the next call is refused once these are spent
         let _ = crate::ratelimit::check(&[&crate::ratelimit::SPACE_READ_ACCOUNT], &did, extra);
     }
-    let mut out = json!({"spaces": page.iter().map(|u| json!({"uri": u})).collect::<Vec<_>>()});
+    let sp = spaces(&app)?;
+    let mut views = Vec::with_capacity(page.len());
+    for uri in &page {
+        let space = Space::parse(uri)?;
+        let mut v = json!({"space": uri});
+        if let Some(h) = load_head(sp, &p, &did, &space).await? {
+            v["repoRev"] = json!(h.rev.to_string());
+            v["data"] = b64(&h.hash.digest());
+        }
+        if space.authority == did {
+            if let Some(rev) = space_rev(&app, &space).await? {
+                v["spaceRev"] = json!(rev.to_string());
+            }
+        }
+        views.push(v);
+    }
+    let mut out = json!({"spaces": views});
     if page.len() == limit {
         out["cursor"] = json!(page.last());
     }
@@ -1428,7 +1588,7 @@ async fn list_spaces(State(app): AppState, Auth(creds): Auth, Query(q): Query<Li
 const LIST_SPACES_ROWS_PER_POINT: u64 = 1000;
 
 /// Up to `limit` URIs past the cursor that `did` holds a repo in or governs
-/// live, in URI order, from `sL/`, and how many rows that read. The `did`
+/// live, in URI order, from `sL/`, and how many rows that read. The `spaceDid`
 /// filter (and `spaceType` with it) narrows the range; `spaceType` alone
 /// seeks past each authority's other types, so a page reads about its own
 /// rows plus one per authority skipped.
@@ -1439,7 +1599,7 @@ async fn list_space_uris(
     limit: usize,
 ) -> anyhow::Result<(Vec<String>, u64)> {
     let base = state::space_did_prefix(state::SPACE_LIST_FAMILY, did);
-    let narrow = match (q.did.as_deref(), q.space_type.as_deref()) {
+    let narrow = match (q.space_did.as_deref(), q.space_type.as_deref()) {
         (Some(a), Some(t)) => format!("at://{a}/space/{t}/"),
         (Some(a), None) => format!("at://{a}/space/"),
         (None, _) => String::new(),
@@ -1498,7 +1658,7 @@ const REVOKE_NUDGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// bounds it.
 const REVOKE_NUDGE_RETRIES: u32 = 6;
 
-/// Reference notifyCredentialRevoked: the space's authority, by service
+/// Reference notifyCredentialsRevoked: the space's authority, by service
 /// auth addressed to an account hosted here, revokes credentials of its
 /// space. Enforced cluster-wide: the 200 comes once the revocation is in
 /// the bucket's control object and the live peers were asked to reload it
@@ -1510,13 +1670,26 @@ const REVOKE_NUDGE_RETRIES: u32 = 6;
 /// ([`revocations::PER_AUD`] and the rest), and the rate limits count only
 /// jtis new here. A revocation that can't be stored blocks the space's
 /// credentials instead, on every node: it fails closed.
-async fn notify_credential_revoked(
+async fn notify_credentials_revoked(
     State(app): AppState,
     headers: HeaderMap,
     Json(inp): Json<RevokedIn>,
 ) -> XResult<StatusCode> {
+    revoke(app, headers, inp, "com.atproto.space.notifyCredentialsRevoked").await
+}
+
+/// notifyCredentialsRevoked by its Nov 5 alpha name, the service token
+/// bound to that name.
+async fn notify_credential_revoked_v0(
+    State(app): AppState,
+    headers: HeaderMap,
+    Json(inp): Json<RevokedIn>,
+) -> XResult<StatusCode> {
+    revoke(app, headers, inp, "com.atproto.space.notifyCredentialRevoked").await
+}
+
+async fn revoke(app: Arc<App>, headers: HeaderMap, inp: RevokedIn, lxm: &str) -> XResult<StatusCode> {
     let sp = spaces(&app)?.clone();
-    let lxm = "com.atproto.space.notifyCredentialRevoked";
     let auth = super::authn::verify_space_service_jwt(&app, &headers, lxm).await?;
     let space = Space::parse(&inp.space)?;
     if inp.credentials.is_empty()
@@ -1749,7 +1922,7 @@ const NOTIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// One outbox send of `p`: a writer's newest durable rev to its space's
 /// authority. A local authority records it on its own worker; any other
-/// gets notifyWrite at its space host with the writer's service auth.
+/// gets notifyRepoUpdate at its space host with the writer's service auth.
 pub async fn deliver(app: &App, p: &Pending) -> Outcome {
     // the shard may have moved since the row was taken
     if app.partition(&p.did).is_err() || app.remote_owner(&p.did).is_some() {
@@ -1795,7 +1968,7 @@ pub async fn deliver(app: &App, p: &Pending) -> Outcome {
     } else if app.partition(&space.authority).is_ok()
         && super::server::account_if_exists(app, &space.authority).await.is_ok_and(|a| a.is_some())
     {
-        let r = process_notify_write(app, &space, &p.did, p.repo_rev, hash, SameRev::Sequence).await;
+        let r = process_notify_repo_update(app, &space, &p.did, p.repo_rev, hash, SameRev::Sequence).await;
         metrics::space_notify("in", notify_in_result(&r));
         return outcome(r.map(|_| ()));
     }
@@ -1805,7 +1978,7 @@ pub async fn deliver(app: &App, p: &Pending) -> Outcome {
     };
     let Some(endpoint) = endpoint else { return Outcome::Retry(format!("{} names no space host", space.authority)) };
     let aud = token::space_host_aud(&space.authority);
-    let lxm = "com.atproto.space.notifyWrite";
+    let lxm = "com.atproto.space.notifyRepoUpdate";
     let jwt = match crate::auth::service_auth_jwt(&key, &p.did, &aud, Some(lxm), 60) {
         Ok(j) => j,
         Err(e) => return Outcome::Retry(format!("service auth: {e}")),
@@ -1880,7 +2053,7 @@ async fn notify_owner(
     }
 }
 
-/// [`notify_owner`] at the owner: notifyWrite from a writer on another node
+/// [`notify_owner`] at the owner: notifyRepoUpdate from a writer on another node
 /// of the cluster, trusted as the cluster's own outbox (no service auth).
 async fn internal_notify(
     State(app): AppState,
@@ -1905,49 +2078,58 @@ async fn internal_notify(
     if super::server::account_if_exists(&app, &space.authority).await?.is_none() {
         return Ok(Json(json!({"hosted": false})));
     }
-    let r = process_notify_write(&app, &space, &inp.repo, repo_rev, hash, SameRev::Sequence).await;
+    let r = process_notify_repo_update(&app, &space, &inp.repo, repo_rev, hash, SameRev::Sequence).await;
     metrics::space_notify("in", notify_in_result(&r));
     r?;
     Ok(Json(json!({"hosted": true})))
 }
 
-/// Deletes `service`'s registration for the space `uri` at its authority
-/// (whose shard is this node's), if it's still expired: renewed since, it
-/// stays.
-pub async fn prune_registration(app: &App, uri: &str, service: &str) -> anyhow::Result<()> {
+/// [`SpaceOp::ClaimLapsed`] at the space `uri`'s authority (whose shard is
+/// this node's).
+pub async fn claim_lapsed(
+    app: &App,
+    uri: &str,
+    ids: Vec<state::RegId>,
+    now: u64,
+) -> anyhow::Result<Vec<crate::space::rows::RegistrationRow>> {
     let space = Space::parse(uri).map_err(|e| anyhow::anyhow!("{}", e.message))?;
-    let p = app.partition(&space.authority).map_err(|e| anyhow::anyhow!("{}", e.message))?;
-    let Some(v) = p.db.get(state::space_notify_key(&space.authority, &space.sid, service)).await? else {
-        return Ok(());
-    };
-    let now = vlatproto::tid::now_micros();
-    if crate::space::rows::NotifyRow::decode(&v)?.expires > now {
-        return Ok(());
+    let op = SpaceOp::ClaimLapsed { ids, now };
+    match submit_space(app, &space.authority, &space, op).await.map_err(|e| anyhow::anyhow!("{}", e.message))? {
+        SpaceAck::Claimed(rows) => Ok(rows),
+        _ => Ok(Vec::new()),
     }
-    unregister_if_expired(app, uri, service, now).await
 }
 
-/// Deletes `service`'s registration for the space `uri` if it expired by
-/// `t`, checked on the authority's worker, so a renewal that lands between
-/// a prune's read and its delete survives.
-pub async fn unregister_if_expired(app: &App, uri: &str, service: &str, t: u64) -> anyhow::Result<()> {
+/// Deletes registration `id` of the space `uri` if it lapsed by `t`,
+/// checked on the authority's worker, so a renewal that lands meanwhile
+/// survives.
+pub async fn unregister_lapsed(app: &App, uri: &str, id: &state::RegId, t: u64) -> anyhow::Result<()> {
     let space = Space::parse(uri).map_err(|e| anyhow::anyhow!("{}", e.message))?;
-    let op = SpaceOp::UnregisterNotify { service: service.to_string(), expired_by: Some(t) };
+    let op = SpaceOp::UnregisterNotify { id: *id, lapsed_by: Some(t) };
     submit_space(app, &space.authority, &space, op).await.map_err(|e| anyhow::anyhow!("{}", e.message))?;
     Ok(())
 }
 
-/// Tests: sets `service`'s registration for the space `uri` to expire at
-/// `expires` (Unix microseconds), through the authority's worker as a
-/// renewal would.
-pub async fn set_registration_expiry(app: &App, uri: &str, service: &str, expires: u64) -> anyhow::Result<()> {
+/// Tests: sets the registration (`endpoint`, `token`) of the space `uri`
+/// to expire at `expires` (Unix microseconds), through the authority's
+/// worker as a renewal would.
+pub async fn set_registration_expiry(
+    app: &App,
+    uri: &str,
+    endpoint: &str,
+    token: &str,
+    expires: u64,
+) -> anyhow::Result<()> {
     let space = Space::parse(uri).map_err(|e| anyhow::anyhow!("{}", e.message))?;
-    let p = app.partition(&space.authority).map_err(|e| anyhow::anyhow!("{}", e.message))?;
-    let key = state::space_notify_key(&space.authority, &space.sid, service);
-    let v = p.db.get(key).await?.ok_or_else(|| anyhow::anyhow!("not registered"))?;
-    let row = crate::space::rows::NotifyRow { expires, ..crate::space::rows::NotifyRow::decode(&v)? };
-    let op = SpaceOp::RegisterNotify { service: service.to_string(), row };
-    submit_space(app, &space.authority, &space, op).await.map_err(|e| anyhow::anyhow!("{}", e.message))?;
+    let row = crate::space::rows::RegistrationRow {
+        endpoint: endpoint.into(),
+        token: token.into(),
+        expires,
+        expiry_notified: false,
+    };
+    submit_space(app, &space.authority, &space, SpaceOp::RegisterNotify { row })
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e.message))?;
     Ok(())
 }
 
@@ -1975,7 +2157,7 @@ async fn get_repo(
     let self_read = assert_space_read(&creds, &space, &q.repo)?;
     assert_space_open(&app, &space, self_read).await?;
     available(&app, &q.repo, self_read).await?;
-    let secret = mac_secret(&app, &headers, &creds, &q.repo, MacType::Repo).await?;
+    let mac = mac_request(&app, &headers, &creds, &q.repo, Profile::Commit).await?;
     metrics::space_read("getRepo", auth_label(&creds));
     let slot = super::sync::export_slot(&app).await?;
     let p = app.partition(&q.repo)?;
@@ -1989,11 +2171,11 @@ async fn get_repo(
         false => Some(served_set(&snap, &q.repo, &space.sid, &head.hash, &hidden).await?),
     };
     let commit = commit_of(&space, &q.repo, &head, set.as_ref());
-    let mac = commit_mac_header(secret, &commit)?;
+    let mac = commit_mac(&mac, &commit);
     let prefix = state::space_prefix(state::SPACE_RECORD_FAMILY, &q.repo, &space.sid);
     let opts = slatedb::config::ScanOptions { read_ahead_bytes: 4 << 20, cache_blocks: true, ..Default::default() };
     let stall = app.config.export_stall;
-    let body = super::sync::export_body(slot, "application/octet-stream", move |tx| async move {
+    let body = super::sync::export_body(slot, "application/vnd.dasl.star", move |tx| async move {
         const CHUNK: usize = super::sync::EXPORT_CHUNK;
         metrics::space_export_bytes(CHUNK);
         let mut buf = Vec::with_capacity(CHUNK + 4096);
@@ -2047,14 +2229,14 @@ async fn flush_chunk(
 /// How far ahead of this host's clock a notified repoRev may be.
 pub(super) const FUTURE_REV: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// Reference `processNotifyWrite` at the space's authority: the space must
+/// Reference `processNotifyRepoUpdate` at the space's authority: the space must
 /// be live here, the writer admitted by the write policy (the authority
 /// always), and its repoRev newer than the one recorded, or the same one
 /// with another hash (a record takedown or its reversal; `same_rev` says
 /// whether that hash is trusted or checked at the writer's host first).
 /// Recorded through the authority's worker, which assigns the spaceRev and
 /// queues the forward to registered services once it's durable.
-pub(super) async fn process_notify_write(
+pub(super) async fn process_notify_repo_update(
     app: &App,
     space: &Space,
     writer: &str,
@@ -2068,12 +2250,12 @@ pub(super) async fn process_notify_write(
     }
     let row = super::space_policy::live_space(app, space).await?;
     if space_takendown(app, space).await? {
-        tracing::debug!(space = %hex::encode(space.sid), "notifyWrite to a taken-down space dropped");
+        tracing::debug!(space = %hex::encode(space.sid), "notifyRepoUpdate to a taken-down space dropped");
         return Ok(Notified::Noop);
     }
     let managing_app = match &row.policy {
         crate::space::rows::Policy::Managed { .. } if writer != space.authority => {
-            Some(super::space_policy::authorize_user(app, space, &row, writer, "write", None).await?)
+            Some(super::space_policy::authorize_repo(app, space, &row, Some(writer), "write", None).await?)
         }
         _ => None,
     };
@@ -2105,7 +2287,7 @@ pub(super) async fn process_notify_write(
     }
 }
 
-/// What an inbound notifyWrite did.
+/// What an inbound notifyRepoUpdate did.
 pub(super) enum Notified {
     Sequenced,
     /// Not newer, or the space is taken down.
@@ -2135,18 +2317,30 @@ fn bytes_field<const N: usize>(v: &J) -> Option<[u8; N]> {
     b.try_into().ok()
 }
 
-/// Reference notifyWrite at a space host: the writer's repo host, by
+/// Reference notifyRepoUpdate at a space host: the writer's repo host, by
 /// service auth from the writer (`iss` is the claimed `repo`, so no host
 /// notifies for another's account) addressed to the space's authority. The
 /// repoRev is checked before auth, as the reference's input validation is.
-async fn notify_write(State(app): AppState, headers: HeaderMap, Json(inp): Json<J>) -> XResult<StatusCode> {
-    spaces(&app)?;
-    let r = notify_write_inner(&app, &headers, &inp).await;
+/// A managing app that can't answer is UpstreamFailure, which the writer's
+/// host retries.
+async fn notify_repo_update(State(app): AppState, headers: HeaderMap, Json(inp): Json<J>) -> XResult<StatusCode> {
+    notify_in(&app, &headers, &inp, "com.atproto.space.notifyRepoUpdate").await
+}
+
+/// notifyRepoUpdate by its Nov 5 alpha name (notifyWrite), the service
+/// token bound to that name. Its spaceRev fields were never read here.
+async fn notify_write_v0(State(app): AppState, headers: HeaderMap, Json(inp): Json<J>) -> XResult<StatusCode> {
+    notify_in(&app, &headers, &inp, "com.atproto.space.notifyWrite").await
+}
+
+async fn notify_in(app: &App, headers: &HeaderMap, inp: &J, lxm: &str) -> XResult<StatusCode> {
+    spaces(app)?;
+    let r = notify_in_inner(app, headers, inp, lxm).await;
     metrics::space_notify("in", notify_in_result(&r));
     r.map(|_| StatusCode::OK)
 }
 
-async fn notify_write_inner(app: &App, headers: &HeaderMap, inp: &J) -> XResult<Notified> {
+async fn notify_in_inner(app: &App, headers: &HeaderMap, inp: &J, lxm: &str) -> XResult<Notified> {
     let field = |k: &str| inp.get(k).and_then(|v| v.as_str());
     let repo_rev = field("repoRev")
         .and_then(Tid::parse)
@@ -2159,15 +2353,15 @@ async fn notify_write_inner(app: &App, headers: &HeaderMap, inp: &J) -> XResult<
         .get("data")
         .and_then(bytes_field::<32>)
         .ok_or_else(|| XrpcError::bad("InvalidRequest", "Input/data must be 32 bytes"))?;
-    let auth = super::authn::verify_space_service_jwt(app, headers, "com.atproto.space.notifyWrite").await?;
+    let auth = super::authn::verify_space_service_jwt(app, headers, lxm).await?;
     if auth.iss != repo {
-        return Err(forbidden("notifyWrite iss does not match claimed writer"));
+        return Err(forbidden("Notification iss does not match the repo"));
     }
     crate::ratelimit::check(&[&crate::ratelimit::SPACE_NOTIFY_IN], &auth.iss, 1)?;
     if auth.aud != space.authority && auth.aud != token::space_host_aud(&space.authority) {
-        return Err(forbidden("notifyWrite aud does not match the space authority"));
+        return Err(forbidden("Notification aud does not match the space authority"));
     }
-    process_notify_write(app, &space, repo, repo_rev, hash, SameRev::Verify).await
+    process_notify_repo_update(app, &space, repo, repo_rev, hash, SameRev::Verify).await
 }
 
 /// A request the space host answers for a credential holder only: the
@@ -2185,7 +2379,7 @@ async fn host_credential(app: &App, headers: &HeaderMap, space: &Space) -> XResu
 }
 
 /// Reference: a space whose authority is taken down or deactivated is
-/// suspended, not deleted. getSpaceCredential and listRepos refuse it with
+/// suspended, not deleted. authorizeSpaceSync and listWriters refuse it with
 /// the public repo's errors, while notifies and registrations still land so
 /// its writer state stays current.
 pub(super) fn authority_suspended(status: Option<&str>) -> XResult<()> {
@@ -2197,13 +2391,13 @@ pub(super) fn authority_suspended(status: Option<&str>) -> XResult<()> {
 }
 
 #[derive(Deserialize)]
-struct ListReposQ {
+struct ListWritersQ {
     space: String,
     limit: Option<i64>,
     cursor: Option<String>,
 }
 
-/// The first spaceRev a listRepos cursor admits. The reference compares it
+/// The first spaceRev a listWriters cursor admits. The reference compares it
 /// with spaceRevs as a plain string; a TID's string order is its numeric
 /// order, so the first TID whose string is greater is found by bisection.
 fn space_rev_after(cursor: &str) -> Option<u64> {
@@ -2225,23 +2419,24 @@ fn space_rev_after(cursor: &str) -> Option<u64> {
     Some(lo)
 }
 
-/// Reference listRepos: each writer's latest state, in spaceRev order after
-/// the cursor (`sQ` joined to `sW` in one snapshot). A writer updated while
-/// a client pages may show up again, as the lexicon says.
-async fn list_repos(State(app): AppState, headers: HeaderMap, Query(q): Query<ListReposQ>) -> XResult<Json<J>> {
+/// Reference listWriters: each writer's latest update, a `repoWrite` or,
+/// until it writes again, a `repoRemoved`, in spaceRev order after the
+/// cursor (`sQ` joined to `sW` in one snapshot). A writer updated while a
+/// client pages may show up again.
+async fn list_writers(State(app): AppState, headers: HeaderMap, Query(q): Query<ListWritersQ>) -> XResult<Json<J>> {
     spaces(&app)?;
     let space = Space::parse(&q.space)?;
     let limit = super::extract::limit_param(q.limit, 100, 1, 1000)?;
     host_credential(&app, &headers, &space).await?;
     // a credential minted before the authority's takedown outlives it by up
-    // to its 300 s; getSpaceCredential's gate alone wouldn't stop it
+    // to its 300 s; authorizeSpaceSync's gate alone wouldn't stop it
     let (_, status) = super::proxy::account_key_status(&app, &space.authority).await?;
     authority_suspended(status.as_deref())?;
     super::space_policy::live_space(&app, &space).await?;
     if space_takendown(&app, &space).await? {
         return Err(super::space_policy::space_not_found());
     }
-    metrics::space_read("listRepos", "credential");
+    metrics::space_read("listWriters", "credential");
     let p = app.partition(&space.authority)?;
     let snap = p.db.snapshot().map_err(XrpcError::from_err)?;
     let prefix = state::space_prefix(state::SPACE_SEQ_FAMILY, &space.authority, &space.sid);
@@ -2271,12 +2466,7 @@ async fn list_repos(State(app): AppState, headers: HeaderMap, Query(q): Query<Li
             let k = state::space_writer_key(&space.authority, &space.sid, &writer);
             let Some(v) = snap.get(k).await.map_err(XrpcError::from_err)? else { continue };
             let w = crate::space::rows::WriterRow::decode(&v).map_err(XrpcError::from_err)?;
-            repos.push(json!({
-                "did": writer,
-                "repoRev": w.repo_rev.to_string(),
-                "data": b64(&w.hash),
-                "spaceRev": space_rev.to_string(),
-            }));
+            repos.push(crate::space::host::WriterUpdate::of(&w).to_json(&writer, space_rev, None));
             last = Some(space_rev);
         }
     }
@@ -2287,95 +2477,12 @@ async fn list_repos(State(app): AppState, headers: HeaderMap, Query(q): Query<Li
     Ok(Json(out))
 }
 
-#[derive(Deserialize)]
-struct RegisterIn {
-    space: String,
-    service: String,
-}
-
-/// Reference registerNotify: a credential holder subscribes a service (a DID
-/// with an optional fragment) to the space's write notifications for a
-/// day. Registering again replaces the endpoint and extends the expiry.
-async fn register_notify(State(app): AppState, headers: HeaderMap, Json(inp): Json<RegisterIn>) -> XResult<Json<J>> {
-    let sp = spaces(&app)?.clone();
-    let space = Space::parse(&inp.space)?;
-    let cred = host_credential(&app, &headers, &space).await?;
-    super::space_policy::assert_space_host(&app, &space).await?;
-    if space_takendown(&app, &space).await? {
-        return Err(super::space_policy::space_not_found());
-    }
-    use crate::space::host::{MAX_REGISTRATIONS, MAX_SERVICE_LEN};
-    if inp.service.len() > MAX_SERVICE_LEN {
-        return Err(XrpcError::bad("InvalidRequest", format!("service must be at most {MAX_SERVICE_LEN} bytes")));
-    }
-    if let Credentials::SpaceCredential { iss, jti, .. } = &cred {
-        let key = super::authn::private_limit_key(&app, &format!("{iss} {jti}"));
-        crate::ratelimit::check(&[&crate::ratelimit::SPACE_REGISTER], &key, 1)?;
-    }
-    // every write of the space is forwarded to each registration: one
-    // member mustn't make that unbounded. Counted and made under the
-    // space's lock, so concurrent registrations can't pass the cap together.
-    let _registering = sp.registering(&space.sid).await;
-    let (live, expired) =
-        crate::space::host::registrations(&app, &space.authority, &space.sid).await.map_err(XrpcError::from_err)?;
-    for service in expired {
-        sp.fanout.prune(&app, &space.uri.as_str().into(), service);
-    }
-    let renewal = live.iter().any(|(s, _)| *s == inp.service);
-    if live.iter().filter(|(s, _)| *s != inp.service).count() >= MAX_REGISTRATIONS {
-        return Err(XrpcError::bad(
-            "InvalidRequest",
-            format!("this space has {MAX_REGISTRATIONS} notify registrations; unregister one first"),
-        ));
-    }
-    if !renewal {
-        let (_, cap) = sp.account_caps();
-        let n = crate::space::host::authority_registrations(&app, &space.authority, cap)
-            .await
-            .map_err(XrpcError::from_err)?;
-        if n >= cap {
-            return Err(XrpcError::bad(
-                "InvalidRequest",
-                format!("this space's authority has {cap} notify registrations across its spaces"),
-            ));
-        }
-    }
-    let Some(endpoint) = crate::space::host::resolve_service_endpoint(&app, &inp.service).await else {
-        return Err(XrpcError::bad(
-            "ServiceNotResolvable",
-            format!("Could not resolve a service endpoint for {}", inp.service),
-        ));
-    };
-    let expires = vlatproto::tid::now_micros() + crate::space::host::REGISTRATION_TTL.as_micros() as u64;
-    let row = crate::space::rows::NotifyRow { endpoint, expires };
-    submit_space(&app, &space.authority, &space, SpaceOp::RegisterNotify { service: inp.service, row }).await?;
-    let at =
-        chrono::DateTime::from_timestamp_micros(expires as i64).ok_or_else(|| XrpcError::internal("bad expiry"))?;
-    Ok(Json(json!({"expiresAt": at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)})))
-}
-
-/// Reference unregisterNotify: not resolved again (a subscriber whose DID
-/// document changed can still withdraw); fine when nothing was registered.
-async fn unregister_notify(
-    State(app): AppState,
-    headers: HeaderMap,
-    Json(inp): Json<RegisterIn>,
-) -> XResult<StatusCode> {
-    spaces(&app)?;
-    let space = Space::parse(&inp.space)?;
-    host_credential(&app, &headers, &space).await?;
-    super::space_policy::assert_space_host(&app, &space).await?;
-    submit_space(&app, &space.authority, &space, SpaceOp::UnregisterNotify { service: inp.service, expired_by: None })
-        .await?;
-    Ok(StatusCode::OK)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn list_repos_cursors_compare_as_strings() {
+    fn list_writers_cursors_compare_as_strings() {
         let t = Tid::from_parts(1_790_000_000_000_000, 3);
         assert_eq!(space_rev_after(&t.to_string()), Some(t.0 + 1));
         for c in ["", "0", "2", "3jzfcijpj2z2", "3jzfcijpj2z2a0", "abc", "b", "bzzzzzzzzzzz"] {

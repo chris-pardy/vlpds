@@ -16,14 +16,14 @@
 //! - [`rows`]: the values of the `s*` state families (keys in `crate::state`).
 //! - [`repo`]: space writes and space host ops on the repo worker.
 //! - [`heads`]: durable space repo heads for reads.
-//! - [`outbox`]: delivery of notifyWrite to space authorities.
-//! - [`host`]: the space host's calls out (managing apps, notifyWrite).
+//! - [`outbox`]: delivery of notifyRepoUpdate to space authorities.
+//! - [`host`]: the space host's calls out (managing apps, registrations, the syncer fan-out).
 //! - [`publish`]: the policy and member records a policy publishes.
-//! - [`fanout`]: forwarding of sequenced writes to registered services.
+//! - [`fanout`]: forwarding of sequenced writer-set updates to registered syncers.
 //! - [`star`]: STAR archives (getRepo, importRepo).
 //! - [`meta`]: the space meta archive (exportSpaceMeta, importSpaceMeta).
 //! - [`mac`]: the KEM shared secret and the MAC headers.
-//! - [`deleted`]: notifySpaceDeleted retries.
+//! - [`notices`]: deletion and expiry notices to syncers, retried.
 //! - [`retention`]: pruning of oplogs past the retention window.
 //! - [`attestation`]: client attestations for `allowedApps`.
 //! - [`revocations`]: revoked credentials.
@@ -33,7 +33,6 @@ pub mod attestation;
 pub mod check;
 pub mod commit;
 pub mod credcache;
-pub mod deleted;
 pub mod fanout;
 pub mod heads;
 pub mod host;
@@ -41,6 +40,7 @@ pub mod httpsig;
 pub mod lthash;
 pub mod mac;
 pub mod meta;
+pub mod notices;
 pub mod outbox;
 pub mod publish;
 pub mod repo;
@@ -78,7 +78,7 @@ pub struct Spaces {
     pub revocations: revocations::Revocations,
     pub credentials: credcache::CredCache,
     pub limits: Limits,
-    /// notifyWrites received from the cluster's other nodes' outboxes.
+    /// notifyRepoUpdates received from the cluster's other nodes' outboxes.
     pub peer_notifies: std::sync::atomic::AtomicU64,
     /// Account and takedown-set reads from SlateDB on this node: the caches
     /// a no-op listRepoOps poll answers from, so tests can assert that
@@ -94,7 +94,8 @@ pub struct Spaces {
     /// (live spaces per authority account, live notify registrations per
     /// authority account); tests lower them.
     account_caps: parking_lot::Mutex<(usize, usize)>,
-    /// registerNotify's count-and-write, per space (striped).
+    /// A registration's count-and-write, and a notice's queueing, per
+    /// space (striped).
     registering: [tokio::sync::Mutex<()>; 64],
     /// Authorities whose shard's owner (another node) said the cluster
     /// doesn't host them, and when: their notifies go out over HTTP without
@@ -418,21 +419,21 @@ impl Spaces {
     }
 
     /// Fan-out lanes live in memory, so a forward queued on the shard's
-    /// last owner may be gone. Each space of the shard with a live
-    /// registration gets one forward of its newest sequenced writer, naming
+    /// last owner may be gone. Each space of the shard with an active
+    /// registration gets one forward of its newest sequenced update, naming
     /// the spaceRev sequenced just before it (`sQ` keeps it: the row that
     /// held it may be gone, and the row before isn't always it): a syncer
     /// that's current ignores it, one that missed something sees the gap
-    /// and pulls listRepos. Once per shard open, nothing in steady state.
+    /// and pulls listWriters. Once per shard open, nothing in steady state.
     async fn catch_up_registrations(&self, db: &slatedb::Db, epoch: u64) -> anyhow::Result<usize> {
         use crate::state::{self, SpaceId};
         let opts = slatedb::config::ScanOptions::default();
-        let mut scan = state::FamilyScan::new(db, state::SPACE_NOTIFY_FAMILY, None, &opts).await?;
+        let mut scan = state::FamilyScan::new(db, state::SPACE_REGISTRATION_FAMILY, None, &opts).await?;
         let now = vlatproto::tid::now_micros();
         let mut spaces: Vec<(String, SpaceId)> = Vec::new();
         while let Some(kv) = scan.next().await? {
             let Some((did, sid)) = rows::did_sid_head(&kv.key) else { continue };
-            if rows::NotifyRow::decode(&kv.value)?.expires <= now {
+            if rows::RegistrationRow::decode(&kv.value)?.lapsed(now) {
                 continue;
             }
             if spaces.last().is_none_or(|(d, s)| d != did || *s != sid) {
@@ -457,8 +458,7 @@ impl Spaces {
                 uri: space.uri.as_str().into(),
                 sid,
                 writer,
-                repo_rev: w.repo_rev,
-                hash: w.hash,
+                update: host::WriterUpdate::of(&w),
                 seq: repo::Sequenced { space_rev, prev },
                 epoch,
                 catch_up: true,
@@ -618,8 +618,8 @@ mod tests {
     fn space_nsids() {
         for yes in [
             "com.atproto.space.getRecord",
-            "com.atproto.memberspace.putMember",
-            "com.atproto.managedspace.checkUserAccess",
+            "com.atproto.memberspace.putMembers",
+            "com.atproto.managedspace.checkAccess",
             "COM.ATPROTO.Space.x",
         ] {
             assert!(is_space_nsid(yes), "{yes}");

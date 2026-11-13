@@ -1,4 +1,4 @@
-//! The notifyWrite outbox (repo-host side). A space write logs an `sP` row
+//! The notifyRepoUpdate outbox (repo-host side). A space write logs an `sP` row
 //! with its rev and hash in the write's own entry, so the notify survives
 //! a crash or takeover after the ack; this is the in-memory side that
 //! sends it.
@@ -508,7 +508,7 @@ impl Outbox {
         }
         self.wake.notify_one();
         if let Outcome::Refused(why) | Outcome::Retry(why) = outcome {
-            tracing::info!(space = %hex::encode(s.sid), rev = %s.repo_rev, "space notifyWrite {result}: {why}");
+            tracing::info!(space = %hex::encode(s.sid), rev = %s.repo_rev, "space notifyRepoUpdate {result}: {why}");
         }
     }
 

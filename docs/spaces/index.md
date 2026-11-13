@@ -28,7 +28,7 @@ facts:
   - { value: alpha, label: behind `--spaces`, note: "off by default · upstream changes weekly", tone: rust }
   - { value: "0", unit: events, label: on the firehose per space write, note: "space writes are private log entries", tone: blue }
   - { value: "~0.8 ms", label: space write p50, note: "measured, interop harness on MinIO · reference ~4.2 ms", tone: amber }
-  - { value: "98ef3a6b", label: upstream pin, note: "bluesky-social/atproto PR #5187" }
+  - { value: "d4def6e9", label: upstream pin, note: "bluesky-social/atproto, the Nov 12 alpha" }
 ```
 
 A space is a group's private data. It has an authority (a DID) that decides who can read and write,
@@ -61,24 +61,28 @@ and vlpds validates that whatever `--spaces` is set to.
 | History | commits | an oplog, kept 7 days on vlpds (`--space-oplog-retention`) |
 | Key | the account's `#atproto` key signs commits | the account's `#atproto_kem` key, which each reader derives its MAC secret against |
 
-A space commit carries no signature. The repo host proves a response to one syncer with an
-`Atproto-Space-Mac` header, an HMAC-SHA256 under a secret that DHKEM(P-256, HKDF-SHA256) gives the
-syncer and the account's `#atproto_kem` key. So the proof is deniable, and a key rotation doesn't
-need any space repo re-signed.
+A space commit carries no signature. A syncer asks for a MAC with an `Accept-Signature` header,
+and the repo host proves its response to that one syncer with an RFC 9421 `hmac-sha256` signature
+over an `Atproto-Space-Commit` (or `Atproto-Space-Record`) header, in `Signature-Input` and
+`Signature`. The secret comes from HPKE secret export (RFC 9180 §6.2: DHKEM(P-256, HKDF-SHA256),
+HKDF-SHA256, Export-only, info `atproto-mac`) between the syncer's ephemeral key and the account's
+`#atproto_kem` key. So the proof is deniable, and a key rotation doesn't need any space repo
+re-signed.
 
 ## Status
 
 This tracks an alpha that ships breaking changes often. The pin is
-bluesky-social/atproto PR #5187 at `98ef3a6b`, and the vendored lexicons and test vectors come
-from it. vlpds has no back-compat for Spaces data yet, so a format change replaces the old one.
+bluesky-social/atproto `d4def6e9`, the Nov 12 alpha, and the vendored lexicons and test vectors
+come from it. Stored data from the Nov 5 alpha is still read where its format changed, and rows it
+can't use are dropped ([Interop](interop.md#what-the-alpha-changed-and-where-it-lands)).
 
 | Part | State |
 |---|---|
 | Space record writes and reads, `listRepoOps`, `getLatestCommit`, `getRepo` | built |
 | The credential chain, revocations, the credential cache | built |
-| space host: the baseline policies (`personalspace`, `memberspace`, `managedspace`), published policy and member records, members, `removeWriter`, `clearRecords`, `getSpaceCredential`, `notifyWrite`, `notifySpaceDeleted` with retries, `listRepos`, fan-out | built |
+| space host: the baseline policies (`personalspace`, `memberspace`, `managedspace`), published policy and member records, members, `removeWriter`, `clearRecords`, `authorizeSpaceSync` with notify registrations, `notifyRepoUpdate`, `listWriters` with removed writers, `notifySpaceUpdate` fan-out, deletion and expiry notices with retries | built |
 | A `#atproto_kem` key for every account, and the MAC on each read | built |
-| The notifyWrite outbox, oplog retention, the 100k record cap | built |
+| The notifyRepoUpdate outbox, oplog retention, the 100k record cap | built |
 | Space blobs (`space.getBlob`, `listBlobs`, the `sync.getBlob` rule) | built |
 | The OAuth consent screen for `space:` scopes | built |
 | Audited operator access to space records, `com.atproto.space.importRepo`, space takedowns | built |

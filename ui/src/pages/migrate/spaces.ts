@@ -59,7 +59,11 @@ export async function plan(old: OAuthSession, onPause: (until: number) => void):
   const seen = new Set<string>()
   for (let cursor: string | undefined; ; ) {
     const page = await retry(() => old.call('com.atproto.space.listSpaces', { params: { limit: 100, cursor } }), onPause)
-    for (const s of page.spaces as { uri: string }[]) uris.push(s.uri)
+    // `uri` before the Nov 12 alpha: the old server may not be past it
+    for (const s of page.spaces as { space?: string; uri?: string }[]) {
+      const uri = s.space ?? s.uri
+      if (uri) uris.push(uri)
+    }
     if (uris.length > MAX_SPACES) throw new Error(`${new URL(old.pds).host} lists more than ${MAX_SPACES} spaces.`)
     cursor = page.cursor
     if (!cursor || !page.spaces.length || seen.has(cursor)) break
@@ -96,8 +100,11 @@ export function reasonOf(e: unknown): string {
       InvalidCommit: 'the copy is damaged',
       DigestMismatch: "the copy's records don't add up to its commit",
       UnsupportedPolicy: "this server doesn't support the space's access rules",
+      InvalidRepoFile: 'the copy is damaged',
+      InvalidSpaceMeta: "the copy of the space's settings is damaged",
+      RepoMismatch: "the copy is another account's",
       NotSpaceOwner: "the space isn't yours to bring",
-      NotAuthorized: "the space's owner no longer lets you write there",
+      NotAuthorized: "the space isn't yours to bring, or its owner no longer lets you write there",
       SpaceNotFound: 'the space no longer exists',
       SpaceDeleted: 'the space was deleted',
       FutureRev: "its last change is dated in the future; check your device's clock and the old server's",
@@ -122,7 +129,7 @@ export async function copySpace(
 ): Promise<SpaceMove> {
   if (p.governed) {
     const meta = await retry(() => old.call<Response>('com.atproto.space.exportSpaceMeta', { params: { space: p.uri }, raw: true }).then((r) => r.blob()), onPause)
-    await retry(() => here.call('com.atproto.space.importSpaceMeta', { body: meta, type: 'application/octet-stream' }), onPause)
+    await retry(() => here.call('com.atproto.space.importSpaceMeta', { body: meta, type: 'application/vnd.dasl.star' }), onPause)
   }
   if (p.empty) return p.governed ? { uri: p.uri, state: 'moved', records: 0, blobs: 0 } : { uri: p.uri, state: 'empty' }
   let star: Blob
@@ -135,7 +142,7 @@ export async function copySpace(
     if (notFound(e)) return p.governed ? { uri: p.uri, state: 'moved', records: 0, blobs: 0 } : { uri: p.uri, state: 'empty' }
     throw e
   }
-  await retry(() => here.call('com.atproto.space.importRepo', { body: star, type: 'application/octet-stream' }), onPause)
+  await retry(() => here.call('com.atproto.space.importRepo', { body: star, type: 'application/vnd.dasl.star' }), onPause)
   const records = starPairs(new Uint8Array(await star.arrayBuffer()))
   let n = 0
   for (const cid of p.blobs) {

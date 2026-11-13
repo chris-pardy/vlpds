@@ -1,5 +1,5 @@
 {
-  "generatedBy": "gen-export.mjs: @atproto/space serializeRepo + RepoCommit.toCommit at the commit in SOURCE",
+  "generatedBy": "gen-export.mjs: @atproto/space writeRepoStar + RepoCommit.toCommit at the commit in SOURCE",
   "did": "did:plc:vlpdsspacesrefexport2345",
   "space": "at://did:plc:vlpdsspacesrefexport2345/space/com.example.group/refexport",
   "rev": "3mvzvh4fs222b",

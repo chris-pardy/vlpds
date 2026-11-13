@@ -1,27 +1,14 @@
-//! Space repo commits and their MACs (@atproto/space `repo-commit.ts`,
-//! `mac.ts`). A commit names the repo, space and rev, and carries the
-//! LtHash digest as `data`. It has no signature: the repo host
-//! authenticates it to one syncer at a time with an HMAC keyed by that
-//! request's shared secret ([`super::mac`]), sent in a response header. A
-//! leaked response proves nothing about what the author wrote to a third
-//! party.
-//!
-//! ```text
-//! commit mac = HMAC-SHA256(secret, "atproto-space-repo-v1"
-//!     || u16be(len) || space || u16be(len) || repo || u16be(len) || rev || data)
-//! record mac = HMAC-SHA256(secret, "atproto-space-record-v1"
-//!     || u16be(len) || uri || cid bytes)
-//! ```
+//! Space repo commits (@atproto/space `repo-commit.ts`). A commit names
+//! the repo, space and rev, and carries the LtHash digest as `data`. It has
+//! no signature: the repo host authenticates it to one syncer at a time
+//! with a MAC keyed by that request's shared secret ([`super::mac`]), sent
+//! in response headers. A leaked response proves nothing about what the
+//! author wrote to a third party.
 
 use super::lthash::LtHash;
-use hmac::{Hmac, KeyInit, Mac};
 use serde_json::{json, Value as J};
-use sha2::Sha256;
 
 pub const COMMIT_VERSION: i64 = 1;
-pub const RECORD_MAC_VERSION: i64 = 1;
-const COMMIT_DOMAIN: &[u8] = b"atproto-space-repo-v1";
-const RECORD_DOMAIN: &[u8] = b"atproto-space-record-v1";
 
 /// The reference's `Commit`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,7 +45,7 @@ impl Commit {
             ver: v["ver"].as_i64()?,
             repo: v["repo"].as_str()?.into(),
             space: v["space"].as_str()?.into(),
-            rev: v["rev"].as_str()?.into(),
+            rev: v["rev"].as_str().filter(|r| vlatproto::tid::Tid::parse(r).is_some())?.into(),
             data: data.try_into().ok()?,
         })
     }
@@ -72,51 +59,28 @@ pub fn element(collection: &str, rkey: &str, cid: &str) -> String {
     format!("{collection}/{rkey}/{cid}")
 }
 
-/// None when a field is longer than its u16 length prefix allows.
-fn keyed(secret: &[u8; 32], domain: &[u8], fields: &[&str]) -> Option<Hmac<Sha256>> {
-    let mut m = <Hmac<Sha256> as KeyInit>::new_from_slice(secret).expect("HMAC takes any key length");
-    m.update(domain);
-    for f in fields {
-        m.update(&u16::try_from(f.len()).ok()?.to_be_bytes());
-        m.update(f.as_bytes());
-    }
-    Some(m)
-}
-
-fn commit_state(secret: &[u8; 32], c: &Commit) -> Option<Hmac<Sha256>> {
-    let mut m = keyed(secret, COMMIT_DOMAIN, &[&c.space, &c.repo, &c.rev])?;
-    m.update(&c.data);
-    Some(m)
-}
-
-/// None when a field is longer than its u16 length prefix allows.
-pub fn commit_mac(secret: &[u8; 32], c: &Commit) -> Option<[u8; 32]> {
-    Some(commit_state(secret, c)?.finalize().into_bytes().into())
-}
-
-/// `cid`: the record's binary CID.
-pub fn record_mac(secret: &[u8; 32], uri: &str, cid: &[u8]) -> Option<[u8; 32]> {
-    let mut m = keyed(secret, RECORD_DOMAIN, &[uri])?;
-    m.update(cid);
-    Some(m.finalize().into_bytes().into())
-}
-
 /// The reference's `verifyCommit`: the commit is for the repo and space
-/// asked for, and its MAC verifies (in constant time). Only then is `data`
-/// the author's claim.
-pub fn verify(c: &Commit, space: &str, repo: &str, secret: &[u8; 32], mac: &[u8]) -> bool {
-    if c.ver != COMMIT_VERSION || c.repo != repo || c.space != space {
-        return false;
+/// asked for, and the response's MAC (requested with `key_share`, whose
+/// shared secret is `secret`) verifies over it. Only then is `data` the
+/// author's claim.
+pub fn verify(
+    c: &Commit,
+    space: &str,
+    repo: &str,
+    key_share: &str,
+    secret: &[u8; 32],
+    headers: &axum::http::HeaderMap,
+) -> Result<(), String> {
+    if c.ver != COMMIT_VERSION {
+        return Err(format!("unsupported commit version: {}", c.ver));
     }
-    commit_state(secret, c).is_some_and(|m| m.verify_slice(mac).is_ok())
-}
-
-/// The reference's `verifyRecordMac`.
-pub fn verify_record(secret: &[u8; 32], uri: &str, cid: &[u8], mac: &[u8]) -> bool {
-    keyed(secret, RECORD_DOMAIN, &[uri]).is_some_and(|mut m| {
-        m.update(cid);
-        m.verify_slice(mac).is_ok()
-    })
+    if c.repo != repo {
+        return Err(format!("commit is for another repo: {}", c.repo));
+    }
+    if c.space != space {
+        return Err(format!("commit is for another space: {}", c.space));
+    }
+    super::mac::verify_commit(c, key_share, secret, headers).map_err(|e| e.0.into_owned())
 }
 
 /// Whether `set` is the repo `commit` describes. Verify the commit first:
@@ -129,7 +93,6 @@ pub fn matches(set: &LtHash, commit: &Commit) -> bool {
 pub(crate) mod tests {
     use super::*;
     use crate::space::vectors::VECTORS;
-    use vlatproto::cid::Cid;
 
     fn h(v: &J) -> Vec<u8> {
         hex::decode(v.as_str().unwrap()).unwrap()
@@ -150,8 +113,8 @@ pub(crate) mod tests {
         set
     }
 
-    /// testdata/spaces-alpha/vectors.json `commits` and `recordMacs`: the
-    /// digest and MACs the reference computes for a fixed shared secret.
+    /// testdata/spaces-alpha/vectors.json `commits`: the digest the
+    /// reference computes (their MACs are [`super::super::mac`]'s).
     #[test]
     fn generated_vectors() {
         let cases = VECTORS["commits"].as_array().unwrap();
@@ -161,68 +124,31 @@ pub(crate) mod tests {
             let (space, repo) = (ctx["space"].as_str().unwrap(), ctx["repo"].as_str().unwrap());
             let commit = Commit::new(&set_of(c), space, repo, ctx["rev"].as_str().unwrap());
             assert_eq!(commit.data[..], h(&c["data"])[..]);
-            let secret = h32(&c["sharedSecret"]);
-            let mac = commit_mac(&secret, &commit).unwrap();
-            assert_eq!(mac[..], h(&c["mac"])[..]);
-            assert!(verify(&commit, space, repo, &secret, &mac));
+            assert_eq!(Commit::from_json(&c["commit"]), Some(commit.clone()));
             assert_eq!(Commit::from_json(&commit.to_json()), Some(commit.clone()));
+            let secret = h32(&c["sharedSecret"]);
+            let headers = super::super::mac::tests::json_map(&c["headers"]);
+            let share = VECTORS["kem"][0]["keyShare"].as_str().unwrap();
+            assert_eq!(verify(&commit, space, repo, share, &secret, &headers), Ok(()));
+            // the requested repo and space, and the version
+            assert!(verify(&commit, space, "did:example:bob", share, &secret, &headers)
+                .unwrap_err()
+                .contains("another repo"));
+            assert!(verify(
+                &commit,
+                "at://did:example:space/space/app.bsky.group/other",
+                repo,
+                share,
+                &secret,
+                &headers
+            )
+            .unwrap_err()
+            .contains("another space"));
+            let v2 = Commit { ver: 2, ..commit.clone() };
+            assert!(verify(&v2, space, repo, share, &secret, &headers)
+                .unwrap_err()
+                .contains("unsupported commit version"));
         }
-        for r in VECTORS["recordMacs"].as_array().unwrap() {
-            let cid = Cid::parse(r["cid"].as_str().unwrap()).unwrap().to_bytes();
-            let (secret, uri) = (h32(&r["sharedSecret"]), r["uri"].as_str().unwrap());
-            let mac = record_mac(&secret, uri, &cid).unwrap();
-            assert_eq!(mac[..], h(&r["mac"])[..]);
-            assert!(verify_record(&secret, uri, &cid, &mac));
-        }
-    }
-
-    // The cases below are the reference's tests/mac.test.ts.
-
-    fn commit() -> Commit {
-        Commit {
-            ver: 1,
-            space: "at://did:example:space/space/app.bsky.group/test".into(),
-            repo: "did:example:alice".into(),
-            rev: "3kbcq3p7ad400".into(),
-            data: [1; 32],
-        }
-    }
-
-    #[test]
-    fn commit_macs() {
-        let secret: [u8; 32] = rand::random();
-        let c = commit();
-        let mac = commit_mac(&secret, &c).unwrap();
-        assert!(verify(&c, &c.space, &c.repo, &secret, &mac));
-        assert!(!verify(&c, &c.space, &c.repo, &rand::random(), &mac));
-        // unambiguous across field boundaries
-        let a = Commit { repo: "did:example:alice".into(), rev: "3kbc".into(), ..commit() };
-        let b = Commit { repo: "did:example:alice3".into(), rev: "kbc".into(), ..commit() };
-        assert_ne!(commit_mac(&secret, &a), commit_mac(&secret, &b));
-        // covers the data digest
-        assert!(!verify(&Commit { data: [2; 32], ..commit() }, &c.space, &c.repo, &secret, &mac));
-        // the requested repo and space, and the version
-        assert!(!verify(&c, &c.space, "did:example:bob", &secret, &mac));
-        assert!(!verify(&c, "at://did:example:space/space/app.bsky.group/other", &c.repo, &secret, &mac));
-        assert!(!verify(&Commit { ver: 2, ..commit() }, &c.space, &c.repo, &secret, &mac));
-        assert!(!verify(&c, &c.space, &c.repo, &secret, &mac[..31]));
-        // a field too long for its prefix
-        assert!(commit_mac(&secret, &Commit { space: "x".repeat(65_536), ..commit() }).is_none());
-    }
-
-    #[test]
-    fn record_macs() {
-        let secret: [u8; 32] = rand::random();
-        let uri = "at://did:example:alice/space/app.bsky.group/test/app.bsky.feed.post/1";
-        let a = Cid::parse("bafyreidefdycgbfy3oglcb6ism3eqhyp5llsrpzxjsuac2gsy4mtrtx244").unwrap().to_bytes();
-        let b = Cid::parse("bafyreidpw4cbv6gr4ukh33z23pvvrpr3wi4gnpmi4doamlsl3sa4rgri2a").unwrap().to_bytes();
-        let mac = record_mac(&secret, uri, &a).unwrap();
-        assert!(verify_record(&secret, uri, &a, &mac));
-        assert!(!verify_record(&rand::random(), uri, &a, &mac));
-        assert!(!verify_record(&secret, &format!("{uri}2"), &a, &mac));
-        assert!(!verify_record(&secret, uri, &b, &mac));
-        // domain-separated from a commit MAC
-        assert_ne!(Some(mac), commit_mac(&secret, &commit()));
     }
 
     #[test]

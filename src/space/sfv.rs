@@ -250,6 +250,20 @@ pub fn serialize_inner_list(items: &[(Bare, Params)], params: &Params) -> String
     format!("({}){}", items.join(" "), serialize_params(params))
 }
 
+/// A bare `true` member is written as its key alone, as structured-headers
+/// does.
+pub fn serialize_dictionary(d: &Dictionary) -> String {
+    let members: Vec<String> = d
+        .iter()
+        .map(|(k, m)| match m {
+            Member::Item(Bare::Bool(true), p) => format!("{k}{}", serialize_params(p)),
+            Member::Item(b, p) => format!("{k}={}", serialize_item(b, p)),
+            Member::InnerList(i, p) => format!("{k}={}", serialize_inner_list(i, p)),
+        })
+        .collect();
+    members.join(", ")
+}
+
 pub fn serialize_item(b: &Bare, p: &Params) -> String {
     serialize_bare(b) + &serialize_params(p)
 }
@@ -321,6 +335,8 @@ mod tests {
             ]
         );
         assert_eq!(parse_dictionary("").unwrap(), vec![]);
+        let d = parse_dictionary("a=1,   b=\"x\";p, c, d=(1 2);q=?0, e=:YWJj:, f=?1, g=?0").unwrap();
+        assert_eq!(serialize_dictionary(&d), "a=1, b=\"x\";p, c, d=(1 2);q=?0, e=:YWJj:, f, g=?0");
         for bad in [
             "a=1,",
             "A=1",

@@ -132,7 +132,7 @@ async fn spaces_e2e_single_node() {
     assert_eq!(metric(&s, noop).await, before + 1.0);
     assert_eq!(loads(&s), loaded, "a poll at the head read the space head from the store");
     let r2 = a.signed_get(&s.url, "com.atproto.space.getLatestCommit", &rq, &cred, &a.did).await;
-    let m = |r: &Resp| r.headers[vlpds::space::mac::MAC_HEADER].clone();
+    let m = |r: &Resp| r.headers["signature"].clone();
     assert_ne!(m(&r2), m(&r), "a MAC per request's key share");
     check_commit(&r2.ok()["commit"], &space, &a.did, &set);
 
@@ -145,10 +145,10 @@ async fn spaces_e2e_single_node() {
     check_commit(&r["commit"], &space, &a.did, &set);
     assert!(r["commit"]["rev"].as_str().unwrap() > head.as_str());
 
-    // a page short of the head carries a cursor, not the commit
+    // a page short of the head carries a cursor, and the current commit
     let page = [("space", space.as_str()), ("repo", a.did.as_str()), ("limit", "1")];
     let r = a.signed_get(&s.url, "com.atproto.space.listRepoOps", &page, &cred, &a.did).await.ok();
-    assert!(r.get("commit").is_none(), "{r}");
+    check_commit(&r["commit"], &space, &a.did, &set);
     let cursor = r["cursor"].as_str().unwrap().to_string();
     let next = [("space", space.as_str()), ("repo", a.did.as_str()), ("cursor", cursor.as_str())];
     let r = a.signed_get(&s.url, "com.atproto.space.listRepoOps", &next, &cred, &a.did).await.ok();
@@ -240,7 +240,7 @@ async fn legacy_auth_and_missing_scopes() {
         let q = [("space", space.as_str())];
         s.xrpc.get("com.atproto.space.getDelegationToken", &q, auth).await.err(403, "InsufficientScope");
         // nor a service token for a space method, which would carry it
-        for lxm in ["com.atproto.space.notifyWrite", "com.atproto.space.notifyCredentialRevoked"] {
+        for lxm in ["com.atproto.space.notifyRepoUpdate", "com.atproto.space.notifyCredentialsRevoked"] {
             let q = [("aud", "did:web:space.example"), ("lxm", lxm)];
             s.xrpc.get("com.atproto.server.getServiceAuth", &q, auth).await.err(400, "InvalidRequest");
         }
@@ -249,11 +249,11 @@ async fn legacy_auth_and_missing_scopes() {
     // covers it (an authority's app revoking at member hosts, a writer's
     // notifying): transition:generic or rpc: alone never
     let lxms = [
-        "com.atproto.space.notifyWrite",
-        "com.atproto.space.notifyCredentialRevoked",
+        "com.atproto.space.notifyRepoUpdate",
+        "com.atproto.space.notifyCredentialsRevoked",
         "com.atproto.space.getRecord",
         "com.atproto.space.getSpace",
-        "COM.ATPROTO.SPACE.notifyWrite",
+        "COM.ATPROTO.SPACE.notifyRepoUpdate",
     ];
     async fn mint(sc: &SpaceClient, lxm: &str) -> Resp {
         sc.get("com.atproto.server.getServiceAuth", &[("aud", "did:web:space.example#svc"), ("lxm", lxm)]).await
@@ -269,18 +269,18 @@ async fn legacy_auth_and_missing_scopes() {
     }
     let g = |scope: &str| format!("transition:generic space:{TYPE}?authority=*&{scope}");
     let manager = SpaceClient::new(&s, "spgm", &g("action=read&manage=update")).await;
-    mint(&manager, "com.atproto.space.notifyCredentialRevoked").await.ok();
-    mint(&manager, "com.atproto.space.notifyWrite").await.err(400, "InvalidRequest");
+    mint(&manager, "com.atproto.space.notifyCredentialsRevoked").await.ok();
+    mint(&manager, "com.atproto.space.notifyRepoUpdate").await.err(400, "InvalidRequest");
     let writer = SpaceClient::new(&s, "spgw", &g(&format!("collection={COLL}&action=create"))).await;
-    mint(&writer, "com.atproto.space.notifyWrite").await.ok();
-    mint(&writer, "COM.ATPROTO.SPACE.notifyWrite").await.ok();
-    mint(&writer, "com.atproto.space.notifyCredentialRevoked").await.err(400, "InvalidRequest");
+    mint(&writer, "com.atproto.space.notifyRepoUpdate").await.ok();
+    mint(&writer, "COM.ATPROTO.SPACE.notifyRepoUpdate").await.ok();
+    mint(&writer, "com.atproto.space.notifyCredentialsRevoked").await.err(400, "InvalidRequest");
     let reader = SpaceClient::new(&s, "spgd", &g("action=read")).await;
-    mint(&reader, "com.atproto.space.notifyWrite").await.err(400, "InvalidRequest");
+    mint(&reader, "com.atproto.space.notifyRepoUpdate").await.err(400, "InvalidRequest");
     mint(&reader, "com.atproto.space.getRecord").await.ok();
     // the user's own spaces (authority=self) carry authority powers
     let own = SpaceClient::new(&s, "spgo", &format!("transition:generic space:{TYPE}?action=read")).await;
-    mint(&own, "com.atproto.space.notifyCredentialRevoked").await.ok();
+    mint(&own, "com.atproto.space.notifyCredentialsRevoked").await.ok();
     // other credentials never, with the flag off too
     let off = TestServer::spawn().await;
     let acct = off.create_account("splo").await;
@@ -354,7 +354,7 @@ async fn authority(mode: Mode) -> Authority {
                     json!({"id": d, "service": [{"id": "#atproto_pds", "type": "AtprotoPersonalDataServer", "serviceEndpoint": b}]}),
                 );
             }
-            if req.uri().path() != "/xrpc/com.atproto.space.notifyWrite" {
+            if req.uri().path() != "/xrpc/com.atproto.space.notifyRepoUpdate" {
                 return json(404, json!({"error": "NotFound"}));
             }
             let auth = req.headers().get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
@@ -389,7 +389,7 @@ fn check_service_jwt(auth: &str, writer: &str, aud: &str, key: &k256::ecdsa::Ver
     let payload: J = serde_json::from_slice(&dec(parts[1])).unwrap();
     assert_eq!(payload["iss"], json!(writer));
     assert_eq!(payload["aud"], json!(format!("{aud}#atproto_pds")));
-    assert_eq!(payload["lxm"], json!("com.atproto.space.notifyWrite"));
+    assert_eq!(payload["lxm"], json!("com.atproto.space.notifyRepoUpdate"));
     let sig = k256::ecdsa::Signature::from_slice(&dec(parts[2])).unwrap();
     key.verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &sig).expect("signed by the writer");
 }

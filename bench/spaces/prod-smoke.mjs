@@ -10,7 +10,7 @@ import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { randomBytes } from 'node:crypto'
 import { P256Keypair } from '@atproto/crypto'
-import { COMMIT_MAC_TYPE, MAC_HEADER, RECORD_MAC_TYPE, WANT_MAC_HEADER, createSpaceSigHeaders, encapsulate, formatWantMacHeader, parseMacHeader, verifyCommit, verifyRecord, verifyRepoStarFull } from '@atproto/space'
+import { COMMIT_MAC_PROFILE, RECORD_MAC_PROFILE, createSpaceSigHeaders, encapsulate, formatMacRequest, verifyCommit, verifyRecord, verifyRepoStarFull } from '@atproto/space'
 import { oauthLogin } from './lib/oauth.mjs'
 import { makeClient, rawXrpc } from './lib/http.mjs'
 
@@ -72,7 +72,7 @@ const skey = `smoke${run}`
 let space
 try {
   const cs = await me.com.atproto.space.createSpace({ spaceType: TYPE, skey, policy: { $type: 'com.atproto.memberspace.policy' } })
-  space = cs.data.uri
+  space = cs.data.space
   check(space === `at://${did}/space/${TYPE}/${skey}`, 'createSpace', space)
 
   const t0 = performance.now()
@@ -94,30 +94,39 @@ try {
   const key = await P256Keypair.create()
   const host = service(await plcDoc(did), '#atproto_pds', 'AtprotoPersonalDataServer') ?? BASE
   const ex = makeClient(host)
-  const cred = (await ex.com.atproto.space.getSpaceCredential({ space, credentialKid: key.did(), delegationToken: dt.data.token })).data.credential
-  check(!!cred, 'delegation token → space credential')
-  const credHeaders = await createSpaceSigHeaders(key, { authorization: `Atproto-Space-Credential ${cred}`, audience: did })
+  const cred = (await ex.com.atproto.space.authorizeSpaceSync({ space, credentialKey: key.did(), delegationToken: dt.data.token })).data.credential
+  check(!!cred, 'delegation token → space credential (authorizeSpaceSync)')
+  const { headers: credHeaders } = await createSpaceSigHeaders({ authorization: `Atproto-Space-Credential ${cred}`, audience: did, keypair: key })
   const reader = makeClient(BASE, ({ headers }) => {
     for (const [k, v] of Object.entries(credHeaders)) headers.set(k, v)
   })
   const kem = await kemKey(did)
   // each MAC-bearing read gets its own key share
-  const withMac = async (type) => {
+  const withMac = async (profile) => {
     const { keyShare, sharedSecret } = await encapsulate(kem)
-    return { sharedSecret, opts: { headers: { [WANT_MAC_HEADER]: formatWantMacHeader(type, keyShare) } } }
+    return { keyShare, sharedSecret, opts: { headers: { 'accept-signature': formatMacRequest(profile, keyShare) } } }
   }
-  const macOf = (res, type) => parseMacHeader(res.headers[MAC_HEADER], type)
-  let m = await withMac(RECORD_MAC_TYPE)
+  // the reference's verifiers throw; a check wants a boolean
+  const ok = async (fn) => {
+    try {
+      await fn()
+      return true
+    } catch {
+      return false
+    }
+  }
+  const macOf = (res, m) => ({ keyShare: m.keyShare, sharedSecret: m.sharedSecret, headers: new Headers(res.headers) })
+  let m = await withMac(RECORD_MAC_PROFILE)
   const got = await reader.com.atproto.space.getRecord({ space, repo: did, collection: POST, rkey }, m.opts)
   check(got.data.value?.body === `private ${SENTINEL}`, 'getRecord with the credential')
-  check(await verifyRecord({ uri: got.data.uri, cid: String(got.data.cid), value: got.data.value }, { uri: w.data.uri, sharedSecret: m.sharedSecret, mac: macOf(got, RECORD_MAC_TYPE) }), "and its record MAC verifies against the account's #atproto_kem key")
-  m = await withMac(COMMIT_MAC_TYPE)
+  check(await ok(() => verifyRecord({ uri: got.data.uri, cid: String(got.data.cid), value: got.data.value }, { uri: w.data.uri, ...macOf(got, m) })), "and its record MAC verifies against the account's #atproto_kem key")
+  m = await withMac(COMMIT_MAC_PROFILE)
   const ops = await reader.com.atproto.space.listRepoOps({ space, repo: did }, m.opts)
   check((ops.data.ops ?? []).length >= 1, 'listRepoOps with the credential')
-  check(verifyCommit(ops.data.commit, { space, repo: did, sharedSecret: m.sharedSecret, mac: macOf(ops, COMMIT_MAC_TYPE) }), "and its commit's MAC verifies")
-  m = await withMac(COMMIT_MAC_TYPE)
+  check(await ok(() => verifyCommit(ops.data.commit, { space, repo: did, ...macOf(ops, m) })), "and its commit's MAC verifies")
+  m = await withMac(COMMIT_MAC_PROFILE)
   const star = await reader.com.atproto.space.getRepo({ space, repo: did }, m.opts)
-  const v = await verifyRepoStarFull([star.data], { space, repo: did, sharedSecret: m.sharedSecret, mac: macOf(star, COMMIT_MAC_TYPE) })
+  const v = await verifyRepoStarFull([star.data], { space, repo: did, ...macOf(star, m) })
   check(v.records.length === 1, 'getRepo STAR verifies (MAC and digest)', v.records.length)
 
   // leaks: public repo and firehose

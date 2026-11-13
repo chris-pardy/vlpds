@@ -26,7 +26,10 @@ use vlpds::space::lthash::LtHash;
 use vlpds::space::token::space_host_aud;
 use vlpds::space::{commit, mac};
 
+/// notifyRepoUpdate by its Nov 5 name, still taken inbound.
 const NOTIFY_WRITE: &str = "com.atproto.space.notifyWrite";
+/// A repo host's notify to the space host.
+const NOTIFY_REPO_UPDATE: &str = "com.atproto.space.notifyRepoUpdate";
 
 /// listRepoOps as `cred` reads the actor's repo, with extra params.
 async fn ops_page(net: &Net, cred: &Cred, space: &str, repo: &str, extra: &[(&str, &str)]) -> J {
@@ -69,31 +72,42 @@ async fn pages_through_a_single_rev_without_dropping_ops() {
     assert_eq!(rkeys, (0..5).map(|i| format!("atomic-{i}")).collect::<Vec<_>>());
 }
 
-/// oplog paging: "withholds the commit until the oplog is drained to head"
+/// oplog paging: "carries the current commit on every page": the syncer's
+/// copy matches it once the last page (no cursor) is applied, not before.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn withholds_the_commit_until_drained_to_head() {
+async fn carries_the_current_commit_on_every_page() {
     let net = Net::new(0).await;
     let (alice, space, cred) = authority_space(&net).await;
     for i in 0..3 {
         write(&alice, &space, W::new().rkey(&format!("paged-{i}"))).await.ok();
     }
-    let first = ops_page(&net, &cred, &space, &alice.did, &[("limit", "1")]).await;
-    assert!(first.get("commit").is_none(), "{first}");
-    let mut cursor = first["cursor"].as_str().map(String::from);
-    assert!(cursor.is_some());
-    let mut seen = vec![first["ops"][0]["rev"].as_str().unwrap().to_string()];
-    let mut commit = J::Null;
-    for _ in 0..5 {
-        let Some(c) = cursor.clone() else { break };
-        let next = ops_page(&net, &cred, &space, &alice.did, &[("cursor", &c), ("limit", "1")]).await;
-        if let Some(r) = next["ops"][0]["rev"].as_str() {
-            seen.push(r.into());
+    let (rev, _) = repo_state(&alice, &space).await.unwrap();
+    let (mut local, mut seen, mut cursor) = (LtHash::default(), Vec::new(), None::<String>);
+    for i in 0..5 {
+        let mut extra = vec![("limit", "1")];
+        if let Some(c) = &cursor {
+            extra.push(("cursor", c));
         }
-        cursor = next["cursor"].as_str().map(String::from);
-        commit = next["commit"].clone();
+        let page = ops_page(&net, &cred, &space, &alice.did, &extra).await;
+        assert_eq!(page["commit"]["rev"], json!(rev), "{page}");
+        for op in page["ops"].as_array().unwrap() {
+            seen.push(op["rev"].as_str().unwrap().to_string());
+            let cid = op["cid"].as_str().unwrap();
+            local.add(&commit::element(op["collection"].as_str().unwrap(), op["rkey"].as_str().unwrap(), cid));
+        }
+        let matches = commit::matches(&local, &commit_of(&page["commit"]));
+        if i == 0 {
+            assert!(!matches, "the first page leaves the syncer behind the commit");
+        }
+        cursor = page["cursor"].as_str().map(String::from);
+        if cursor.is_none() {
+            assert!(matches, "the last page brings the syncer to the commit");
+            break;
+        }
     }
+    assert_eq!(seen.len(), 3);
     assert_eq!(seen.iter().collect::<BTreeSet<_>>().len(), seen.len(), "each page advances: {seen:?}");
-    assert!(commit.is_object(), "the last page carries the commit");
+    assert!(cursor.is_none());
 }
 
 /// oplog paging: "pages with since and cursor together"
@@ -157,7 +171,7 @@ async fn rejects_a_malformed_cursor() {
     let (alice, space, cred) = authority_space(&net).await;
     write(&alice, &space, W::new().rkey("cursor-check")).await.ok();
     let q = [("space", space.as_str()), ("repo", alice.did.as_str()), ("cursor", "not-a-cursor")];
-    cred.get(&net.pds[0].url, "com.atproto.space.listRepoOps", &q).await.err(400, "MalformedCursor");
+    cred.get(&net.pds[0].url, "com.atproto.space.listRepoOps", &q).await.err(400, "InvalidCursor");
 }
 
 // ---------------------------------------------------------------------------
@@ -250,8 +264,8 @@ async fn get_repo_serves_a_verifiable_star_archive() {
     let cred = net.credential_for(&carol, &space).await;
     let r = cred.get(&net.pds[1].url, "com.atproto.space.getRepo", &[("space", &space), ("repo", &bob.did)]).await;
     assert_eq!(r.status, 200, "{}", r.text());
-    assert!(r.header("content-type").unwrap_or_default().contains("application/octet-stream"));
-    assert!(r.headers.contains_key(vlpds::space::mac::MAC_HEADER), "a MAC");
+    assert!(r.header("content-type").unwrap_or_default().contains("application/vnd.dasl.star"));
+    assert!(r.headers.contains_key("atproto-space-commit") && r.headers.contains_key("signature"), "a MAC");
     let got = verify_star(&r.body, &space, &bob.did);
     assert_eq!(got.records.len(), 4);
     let (rev, hash) = repo_state(&bob, &space).await.unwrap();
@@ -292,9 +306,10 @@ async fn reports_repo_not_found_for_an_unwritten_repo() {
     let (alice, carol) = (net.actor("alice", 0).await, net.actor("carol", 2).await);
     let space = net.create_space(&alice, SpaceOpts { members: &[&carol], ..Default::default() }).await;
     let cred = net.credential_for(&carol, &space).await;
-    cred.get(&net.pds[0].url, "com.atproto.space.getLatestCommit", &[("space", &space), ("repo", &alice.did)])
-        .await
-        .err(400, "RepoNotFound");
+    let q = [("space", space.as_str()), ("repo", alice.did.as_str())];
+    for nsid in ["com.atproto.space.getLatestCommit", "com.atproto.space.listRepoOps"] {
+        cred.get(&net.pds[0].url, nsid, &q).await.err(400, "RepoNotFound");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -324,8 +339,8 @@ async fn oauth_get_with(sc: &SpaceClient, nsid: &str, query: &[(&str, &str)], ex
     unreachable!()
 }
 
-fn want_mac(ty: mac::MacType, share: &str) -> (String, String) {
-    (mac::WANT_MAC_HEADER.to_string(), mac::format_want_mac(ty, share))
+fn want_mac(p: mac::Profile, share: &str) -> (String, String) {
+    (mac::ACCEPT_SIGNATURE.to_string(), mac::format_request(p, share))
 }
 
 /// MACs: "publishes a KEM key for each account": the key the account's
@@ -361,27 +376,28 @@ async fn macs_a_record_served_to_a_syncer() {
     let kem = kem_key_at(&cred.http, host, &bob.did).await.expect("bob's KEM key");
     let (share, secret) = mac::encapsulate(&kem).unwrap();
     let mut headers = cred.headers(&bob.did);
-    headers.push(want_mac(mac::MacType::Record, &share));
+    headers.push(want_mac(mac::Profile::Record, &share));
     let q = [("space", space.as_str()), ("repo", bob.did.as_str()), ("collection", TEST_COLLECTION), ("rkey", "maced")];
     let r = raw_get(host, "com.atproto.space.getRecord", &q, &headers).await;
     assert_eq!(r.status, 200, "{}", r.text());
-    let header = r.headers.get(mac::MAC_HEADER).and_then(|v| v.to_str().ok());
-    assert!(header.unwrap().starts_with("type=\"atproto-space-record\""), "{header:?}");
-    let m = mac::parse_mac(header, mac::MacType::Record).unwrap();
+    let header = r.header("atproto-space-record").unwrap_or_default();
     let uri = format!("{space}/{}/{TEST_COLLECTION}/maced", bob.did);
+    let cid_s = r.json["cid"].as_str().unwrap();
+    assert_eq!(header, format!("uri=\"{uri}\", cid=\"{cid_s}\""));
     assert_eq!(r.json["uri"], json!(uri));
-    let cid = vlatproto::cid::Cid::parse(r.json["cid"].as_str().unwrap()).unwrap().to_bytes();
-    assert!(commit::verify_record(&secret, &uri, &cid, &m));
-    assert!(!commit::verify_record(&secret, &format!("{uri}x"), &cid, &m), "bound to this one record");
+    assert_eq!(mac::verify_record(&uri, cid_s, &share, &secret, &r.headers), Ok(()));
+    let e = mac::verify_record(&format!("{uri}x"), cid_s, &share, &secret, &r.headers).unwrap_err();
+    assert!(e.0.contains("record does not match"), "bound to this one record: {e}");
+    let cid = vlatproto::cid::Cid::parse(cid_s).unwrap().to_bytes();
     // and the record's encoding is the CID's
     let bytes = Value::from_json(&r.json["value"]).unwrap().to_cbor();
     assert_eq!(vlatproto::cid::Cid::dag_cbor(&bytes).to_bytes(), cid);
 }
 
-/// MACs: "omits the MAC from an oplog page without a commit" (the page was
-/// still asked for one, as every page must be).
+/// MACs: "macs every oplog page": a page with a cursor carries the commit
+/// and its MAC; without a MAC request it is refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn omits_the_mac_from_an_oplog_page_without_a_commit() {
+async fn macs_every_oplog_page() {
     let net = Net::new(0).await;
     let (alice, bob) = (net.actor("alice", 0).await, net.actor("bob", 0).await);
     let space = net.create_space(&alice, SpaceOpts { members: &[&bob], ..Default::default() }).await;
@@ -390,17 +406,17 @@ async fn omits_the_mac_from_an_oplog_page_without_a_commit() {
     let cred = net.credential_for(&bob, &space).await;
     let host = &net.pds[0].url;
     let q = [("space", space.as_str()), ("repo", bob.did.as_str()), ("limit", "1")];
+    // the MAC is verified as it's served (`signed_get_kem`)
     let page = cred.get(host, "com.atproto.space.listRepoOps", &q).await;
-    assert!(page.ok().get("commit").is_none(), "{}", page.text());
-    assert!(page.headers.get(mac::MAC_HEADER).is_none());
-    // the page without a commit still needed the request header
+    assert!(page.ok()["cursor"].is_string(), "{}", page.text());
+    assert!(page.json["commit"].is_object());
     let r = raw_get(host, "com.atproto.space.listRepoOps", &q, &cred.headers(&bob.did)).await;
-    r.err(400, "BadSpaceMac");
+    r.err(400, "InvalidSpaceMac");
 }
 
 /// MACs: "requires a MAC request with a space credential": none, a record
 /// MAC asked of a method that returns a commit, and a key share that isn't
-/// a key are each 400 BadSpaceMac.
+/// a key are each 400 InvalidSpaceMac.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn requires_a_mac_request_with_a_space_credential() {
     let net = Net::new(0).await;
@@ -411,17 +427,26 @@ async fn requires_a_mac_request_with_a_space_credential() {
     let host = &net.pds[0].url;
     let q = [("space", space.as_str()), ("repo", bob.did.as_str())];
     let signed = cred.headers(&bob.did);
-    raw_get(host, "com.atproto.space.getLatestCommit", &q, &signed).await.err(400, "BadSpaceMac");
+    raw_get(host, "com.atproto.space.getLatestCommit", &q, &signed).await.err(400, "InvalidSpaceMac");
     let kem = kem_key_at(&cred.http, host, &bob.did).await.unwrap();
     let (share, _) = mac::encapsulate(&kem).unwrap();
     for (what, header) in [
-        ("a record MAC type", want_mac(mac::MacType::Record, &share)),
-        ("a key share that isn't a key", want_mac(mac::MacType::Repo, "did:key:nope")),
+        ("a record MAC profile", want_mac(mac::Profile::Record, &share)),
+        ("a key share that isn't a key", want_mac(mac::Profile::Commit, "did:key:nope")),
+        (
+            "a key share that isn't P-256",
+            want_mac(mac::Profile::Commit, &vlatproto::crypto::Keypair::generate().did_key()),
+        ),
+        ("a malformed header", (mac::ACCEPT_SIGNATURE.into(), "???".into())),
+        ("a parameter the host can't fulfil", {
+            let (k, v) = want_mac(mac::Profile::Commit, &share);
+            (k, format!("{v};created=1700000000"))
+        }),
     ] {
         let mut h = signed.clone();
         h.push(header);
         let r = raw_get(host, "com.atproto.space.getLatestCommit", &q, &h).await;
-        assert_eq!((r.status, r.error_name()), (400, Some("BadSpaceMac")), "{what}: {}", r.text());
+        assert_eq!((r.status, r.error_name()), (400, Some("InvalidSpaceMac")), "{what}: {}", r.text());
     }
     // with the right one, it verifies
     cred.get(host, "com.atproto.space.getLatestCommit", &q).await.ok();
@@ -439,14 +464,19 @@ async fn macs_an_account_its_own_data_only_when_asked() {
     let q = [("space", space.as_str()), ("repo", bob.did.as_str())];
     let unasked = oauth_get_with(&bob, "com.atproto.space.getLatestCommit", &q, &[]).await;
     assert_eq!(unasked.status, 200, "{}", unasked.text());
-    assert!(unasked.headers.get(mac::MAC_HEADER).is_none());
-    let vary = |r: &Resp| r.headers.get_all("vary").iter().any(|v| v.to_str().unwrap().contains(mac::WANT_MAC_HEADER));
-    assert!(vary(&unasked), "Vary names the MAC request header");
+    assert!(unasked.headers.get("signature").is_none());
+    let vary = |r: &Resp| r.headers.get_all("vary").iter().any(|v| v.to_str().unwrap().contains("Accept-Signature"));
+    assert!(vary(&unasked), "Vary names Accept-Signature");
+    // a request for some other kind of signature is ignored, not refused
+    let other = [(mac::ACCEPT_SIGNATURE.to_string(), "other=(\"@status\");tag=\"other\"".to_string())];
+    let other = oauth_get_with(&bob, "com.atproto.space.getLatestCommit", &q, &other).await;
+    assert_eq!(other.status, 200, "{}", other.text());
+    assert!(other.headers.get("signature").is_none());
 
     let kem = kem_key_at(&bob.srv.http, &net.pds[0].url, &bob.did).await.unwrap();
     let (share, secret) = mac::encapsulate(&kem).unwrap();
     let asked =
-        oauth_get_with(&bob, "com.atproto.space.getLatestCommit", &q, &[want_mac(mac::MacType::Repo, &share)]).await;
+        oauth_get_with(&bob, "com.atproto.space.getLatestCommit", &q, &[want_mac(mac::Profile::Commit, &share)]).await;
     assert_eq!(asked.status, 200, "{}", asked.text());
     let expose = asked
         .headers
@@ -454,10 +484,11 @@ async fn macs_an_account_its_own_data_only_when_asked() {
         .iter()
         .map(|v| v.to_str().unwrap().to_lowercase())
         .collect::<Vec<_>>();
-    assert!(expose.iter().any(|v| v.contains(mac::MAC_HEADER)), "{expose:?}");
-    let m =
-        mac::parse_mac(asked.headers.get(mac::MAC_HEADER).and_then(|v| v.to_str().ok()), mac::MacType::Repo).unwrap();
-    assert!(commit::verify(&commit_of(&asked.json["commit"]), &space, &bob.did, &secret, &m));
+    for name in ["atproto-space-commit", "signature-input", "signature"] {
+        assert!(expose.iter().any(|v| v == name), "{name}: {expose:?}");
+    }
+    let c = commit_of(&asked.json["commit"]);
+    assert_eq!(commit::verify(&c, &space, &bob.did, &share, &secret, &asked.headers), Ok(()));
 }
 
 // ---------------------------------------------------------------------------
@@ -483,7 +514,7 @@ async fn records_a_co_located_writer_without_resolving_it() {
     assert_eq!(net.await_writer(&alice, &space, &dan.did).await, [dan.did.as_str()]);
 }
 
-/// writer set: "records a writer from notifyWrite, and it is not the member
+/// writer set: "records a writer from notifyRepoUpdate, and it is not the member
 /// list"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn records_a_writer_from_notify_write() {
@@ -494,8 +525,8 @@ async fn records_a_writer_from_notify_write() {
     let dids = net.await_writer(&alice, &space, &bob.did).await;
     assert!(dids.contains(&bob.did) && !dids.contains(&alice.did), "{dids:?}");
     let cred = net.credential_for(&bob, &space).await;
-    let repos = cred.get(&net.pds[0].url, "com.atproto.space.listRepos", &[("space", &space)]).await.ok();
-    let entry = repos["repos"].as_array().unwrap().iter().find(|r| r["did"] == json!(bob.did)).unwrap().clone();
+    let repos = cred.get(&net.pds[0].url, "com.atproto.space.listWriters", &[("space", &space)]).await.ok();
+    let entry = repos["repos"].as_array().unwrap().iter().find(|r| r["repo"] == json!(bob.did)).unwrap().clone();
     let (rev, hash) = repo_state(&bob, &space).await.unwrap();
     assert_eq!(entry["repoRev"], json!(rev));
     assert_eq!(bytes_field(&entry["data"]), hash);
@@ -538,17 +569,17 @@ async fn records_a_writer_into_an_allow_list_space() {
 }
 
 // ---------------------------------------------------------------------------
-// space catch-up (listRepos)
+// space catch-up (listWriters)
 // ---------------------------------------------------------------------------
 
 async fn list_repos(net: &Net, cred: &Cred, space: &str, extra: &[(&str, &str)]) -> J {
     let mut q = vec![("space", space)];
     q.extend_from_slice(extra);
-    cred.get(&net.pds[0].url, "com.atproto.space.listRepos", &q).await.ok()
+    cred.get(&net.pds[0].url, "com.atproto.space.listWriters", &q).await.ok()
 }
 
 fn repo_dids(page: &J) -> Vec<String> {
-    page["repos"].as_array().unwrap().iter().map(|r| r["did"].as_str().unwrap().to_string()).collect()
+    page["repos"].as_array().unwrap().iter().map(|r| r["repo"].as_str().unwrap().to_string()).collect()
 }
 
 /// space catch-up: "recovers missed notifications with a space checkpoint"
@@ -561,8 +592,7 @@ async fn recovers_missed_notifications_with_a_space_checkpoint() {
     syncer.respond(503, json!({}));
     let space = net.create_space(&alice, SpaceOpts { members: &[&bob, &dan, &carol], ..Default::default() }).await;
     let cred = net.credential_for(&carol, &space).await;
-    let reg = json!({"space": space, "service": syncer.service_ref()});
-    cred.post(&net.pds[0].url, "com.atproto.space.registerNotify", reg).await.ok();
+    net.register(&carol, &space, syncer.notify()).await.ok();
     assert_eq!(list_repos(&net, &cred, &space, &[]).await["repos"], json!([]));
 
     write(&bob, &space, W::new()).await.ok();
@@ -637,7 +667,7 @@ async fn resumes_after_an_empty_page() {
     assert!(got["repos"][0]["spaceRev"].as_str().unwrap() > cursor.as_str());
 }
 
-/// space catch-up: "accepts arbitrary string listRepos cursors"
+/// space catch-up: "accepts arbitrary string listWriters cursors"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn accepts_arbitrary_string_list_repos_cursors() {
     let net = Net::new(0).await;
@@ -660,17 +690,16 @@ async fn chains_forwarded_notifications() {
     let syncer = MockService::syncer().await;
     let space = net.create_space(&alice, SpaceOpts { members: &[&bob, &dan, &carol], ..Default::default() }).await;
     let cred = net.credential_for(&carol, &space).await;
-    let reg = json!({"space": space, "service": syncer.service_ref()});
-    cred.post(&net.pds[0].url, "com.atproto.space.registerNotify", reg).await.ok();
+    net.register(&carol, &space, syncer.notify()).await.ok();
     write(&alice, &space, W::new()).await.ok();
     let (b, d) = tokio::join!(write(&bob, &space, W::new()), write(&dan, &space, W::new()));
     b.ok();
     d.ok();
-    let calls = syncer.await_calls(NOTIFY_WRITE, 3, Duration::from_secs(15)).await.expect("three forwards");
+    syncer.await_calls(NOTIFY_SPACE_UPDATE, 3, Duration::from_secs(15)).await.expect("three forwards");
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let bodies: Vec<J> = syncer.calls_to(NOTIFY_WRITE).into_iter().map(|c| c.body).collect();
+    let bodies = syncer.updates();
     assert_eq!(bodies.len(), 3, "{bodies:?}");
-    let revs: Vec<&str> = calls.iter().map(|c| c.body["spaceRev"].as_str().unwrap()).collect();
+    let revs: Vec<&str> = bodies.iter().map(|b| b["spaceRev"].as_str().unwrap()).collect();
     let mut sorted = revs.clone();
     sorted.sort();
     assert_eq!(revs, sorted, "sent in spaceRev order");
@@ -698,7 +727,7 @@ async fn notify_resolves_the_space_host_through_atproto_pds() {
     let space = format!("at://{}/space/{TEST_SPACE_TYPE}/resolve", pds.did);
     write(&writer, &space, W::new()).await.ok();
     let (rev, _) = repo_state(&writer, &space).await.unwrap();
-    let got = pds.await_calls(NOTIFY_WRITE, 1, Duration::from_secs(10)).await.expect("notified");
+    let got = pds.await_calls(NOTIFY_REPO_UPDATE, 1, Duration::from_secs(10)).await.expect("notified");
     assert_eq!(got[0].body["repoRev"], json!(rev));
     let claims = jwt_claims(got[0].auth.as_deref().unwrap().trim_start_matches("Bearer "));
     assert_eq!(claims["aud"], json!(format!("{}#atproto_pds", pds.did)));
@@ -707,7 +736,7 @@ async fn notify_resolves_the_space_host_through_atproto_pds() {
     let space = format!("at://{}/space/{TEST_SPACE_TYPE}/resolve", retired.did);
     write(&writer, &space, W::new()).await.ok();
     assert!(
-        retired.await_calls(NOTIFY_WRITE, 1, Duration::from_secs(2)).await.is_none(),
+        retired.await_calls(NOTIFY_REPO_UPDATE, 1, Duration::from_secs(2)).await.is_none(),
         "#atproto_space_host is used"
     );
 }
@@ -727,38 +756,40 @@ async fn retries_the_latest_state_after_failure_and_restart() {
     write(&w, &space, W::new()).await.ok();
     let (rev, hash) = repo_state(&w, &space).await.unwrap();
     retry("the newest rev refused once", || {
-        std::future::ready(host.calls_to(NOTIFY_WRITE).iter().any(|c| c.body["repoRev"] == json!(rev)).then_some(()))
+        std::future::ready(
+            host.calls_to(NOTIFY_REPO_UPDATE).iter().any(|c| c.body["repoRev"] == json!(rev)).then_some(()),
+        )
     })
     .await;
     vlpds::server::shutdown(&first.app).await;
     host.respond(200, json!({}));
-    let refused = host.calls_to(NOTIFY_WRITE).len();
+    let refused = host.calls_to(NOTIFY_REPO_UPDATE).len();
     let _second = cluster_node("rr", store, 8, |c| c.spaces = true).await;
     let calls =
-        host.await_calls(NOTIFY_WRITE, refused + 1, Duration::from_secs(15)).await.expect("resent after restart");
+        host.await_calls(NOTIFY_REPO_UPDATE, refused + 1, Duration::from_secs(15)).await.expect("resent after restart");
     let last = calls.last().unwrap();
     assert_eq!(last.body["repoRev"], json!(rev));
     assert_eq!(bytes_field(&last.body["data"]), hash);
     tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(host.calls_to(NOTIFY_WRITE).len(), refused + 1, "delivered once");
+    assert_eq!(host.calls_to(NOTIFY_REPO_UPDATE).len(), refused + 1, "delivered once");
 }
 
 // ---------------------------------------------------------------------------
-// notifyWrite (inbound, at the authority)
+// notifyRepoUpdate (inbound, at the authority)
 // ---------------------------------------------------------------------------
 
-/// notifyWrite at alice's PDS, signed by `signer`'s account key.
+/// notifyRepoUpdate at alice's PDS, signed by `signer`'s account key.
 async fn notify(net: &Net, signer: &SpaceClient, aud: Option<&str>, body: J) -> Resp {
     let aud = aud.map(String::from).unwrap_or_else(|| space_host_aud(authority_of(body["space"].as_str().unwrap())));
-    let jwt = service_jwt(signer, &aud, NOTIFY_WRITE).await;
-    post_service(&net.pds[0].url, NOTIFY_WRITE, &jwt, body).await
+    let jwt = service_jwt(signer, &aud, NOTIFY_REPO_UPDATE).await;
+    post_service(&net.pds[0].url, NOTIFY_REPO_UPDATE, &jwt, body).await
 }
 
 fn notify_body(space: &str, repo: &str, rev: &str, hash: &[u8]) -> J {
     json!({"space": space, "repo": repo, "repoRev": rev, "data": json_bytes(hash)})
 }
 
-/// notifyWrite: "ignores duplicate and older revisions without forwarding
+/// notifyRepoUpdate: "ignores duplicate and older revisions without forwarding
 /// them"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn notify_write_ignores_duplicate_and_older_revisions() {
@@ -767,13 +798,12 @@ async fn notify_write_ignores_duplicate_and_older_revisions() {
     let syncer = MockService::syncer().await;
     let space = net.create_space(&alice, SpaceOpts { members: &[&bob], ..Default::default() }).await;
     let cred = net.credential_for(&alice, &space).await;
-    let reg = json!({"space": space, "service": syncer.service_ref()});
-    cred.post(&net.pds[0].url, "com.atproto.space.registerNotify", reg).await.ok();
+    net.register(&alice, &space, syncer.notify()).await.ok();
     write(&bob, &space, W::new()).await.ok();
     let (older, _) = repo_state(&bob, &space).await.unwrap();
     write(&bob, &space, W::new()).await.ok();
     let (newest, _) = repo_state(&bob, &space).await.unwrap();
-    syncer.await_calls(NOTIFY_WRITE, 2, Duration::from_secs(10)).await;
+    syncer.await_calls(NOTIFY_SPACE_UPDATE, 2, Duration::from_secs(10)).await;
     retry("the newest rev at the authority", || {
         let (net, cred, space, newest) = (&net, &cred, &space, &newest);
         async move {
@@ -784,7 +814,7 @@ async fn notify_write_ignores_duplicate_and_older_revisions() {
     .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     let before = list_repos(&net, &cred, &space, &[]).await;
-    let calls = syncer.calls_to(NOTIFY_WRITE).len();
+    let calls = syncer.calls_to(NOTIFY_SPACE_UPDATE).len();
     // a duplicate is the newest rev with the hash the authority holds: an
     // equal rev with another hash is a takedown's adjusted view, which vlpds
     // sequences again (a divergence, tests/REFERENCE_COVERAGE.md)
@@ -793,10 +823,10 @@ async fn notify_write_ignores_duplicate_and_older_revisions() {
     notify(&net, &bob, None, notify_body(&space, &bob.did, &newest, &held)).await.ok();
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(list_repos(&net, &cred, &space, &[]).await, before);
-    assert_eq!(syncer.calls_to(NOTIFY_WRITE).len(), calls);
+    assert_eq!(syncer.calls_to(NOTIFY_SPACE_UPDATE).len(), calls);
 }
 
-/// notifyWrite: "keeps the newest repo revision when notifications race"
+/// notifyRepoUpdate: "keeps the newest repo revision when notifications race"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn notify_write_keeps_the_newest_revision_when_racing() {
     let net = Net::new(1).await;
@@ -819,7 +849,7 @@ async fn notify_write_keeps_the_newest_revision_when_racing() {
     assert_eq!(bytes_field(&repos[0]["data"]), empty.to_vec());
 }
 
-/// notifyWrite: "rejects future revisions while allowing a small clock skew"
+/// notifyRepoUpdate: "rejects future revisions while allowing a small clock skew"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn notify_write_rejects_future_revisions() {
     let net = Net::new(1).await;
@@ -833,7 +863,7 @@ async fn notify_write_rejects_future_revisions() {
     assert_eq!(net.writer_dids(&alice, &space).await, [bob.did.as_str()]);
 }
 
-/// notifyWrite: "rejects one that spoofs the writer"
+/// notifyRepoUpdate: "rejects one that spoofs the writer"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn notify_write_rejects_a_spoofed_writer() {
     let net = Net::new(2).await;
@@ -844,7 +874,7 @@ async fn notify_write_rejects_a_spoofed_writer() {
     refused_mentioning(&r, &["iss does not match"]);
 }
 
-/// notifyWrite: "rejects one addressed to another authority"
+/// notifyRepoUpdate: "rejects one addressed to another authority"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn notify_write_rejects_one_addressed_to_another_authority() {
     let net = Net::new(2).await;
@@ -856,7 +886,7 @@ async fn notify_write_rejects_one_addressed_to_another_authority() {
     refused_mentioning(&r, &["aud"]);
 }
 
-/// notifyWrite: "rejects one from a non-member"
+/// notifyRepoUpdate: "rejects one from a non-member"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn notify_write_rejects_a_non_member() {
     let net = Net::new(2).await;
@@ -867,7 +897,7 @@ async fn notify_write_rejects_a_non_member() {
     refused_mentioning(&r, &["not authorized"]);
 }
 
-/// notifyWrite: "rejects a member without write access"
+/// notifyRepoUpdate: "rejects a member without write access"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn notify_write_rejects_a_member_without_write_access() {
     let net = Net::new(1).await;
@@ -878,14 +908,46 @@ async fn notify_write_rejects_a_member_without_write_access() {
     refused_mentioning(&r, &["not authorized"]);
 }
 
-/// notifyWrite: "rejects a repoRev that is not a TID before any auth check"
+/// notifyRepoUpdate: "rejects a member without write access even when
+/// writes are public"
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn notify_rejects_a_member_without_write_access_under_public_write() {
+    let net = Net::new(2).await;
+    let (alice, bob, carol) = (net.actor("alice", 0).await, net.actor("bob", 1).await, net.actor("carol", 2).await);
+    let opts = SpaceOpts { policy: Some(memberspace(json!({"publicWrite": true}))), ..Default::default() };
+    let space = net.create_space(&alice, opts).await;
+    put_member(&alice, &space, &bob, true, false).await.ok();
+    let empty = LtHash::default().digest();
+    let r = notify(&net, &bob, None, notify_body(&space, &bob.did, &next_tid(None), &empty)).await;
+    refused_mentioning(&r, &["not authorized"]);
+    notify(&net, &carol, None, notify_body(&space, &carol.did, &next_tid(None), &empty)).await.ok();
+    assert_eq!(net.writer_dids(&alice, &space).await, vec![carol.did.clone()]);
+}
+
+/// notifyRepoUpdate by its Nov 5 alpha name, notifyWrite, from a repo host
+/// not yet past it: still taken, its token bound to that name
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn notify_write_is_still_taken() {
+    let net = Net::new(1).await;
+    let (alice, bob) = (net.actor("alice", 0).await, net.actor("bob", 1).await);
+    let space = net.create_space(&alice, SpaceOpts { members: &[&bob], ..Default::default() }).await;
+    let body = notify_body(&space, &bob.did, &next_tid(None), &LtHash::default().digest());
+    let aud = space_host_aud(&alice.did);
+    let wrong = service_jwt(&bob, &aud, NOTIFY_REPO_UPDATE).await;
+    post_service(&net.pds[0].url, NOTIFY_WRITE, &wrong, body.clone()).await.client_err();
+    let jwt = service_jwt(&bob, &aud, NOTIFY_WRITE).await;
+    post_service(&net.pds[0].url, NOTIFY_WRITE, &jwt, body).await.ok();
+    assert_eq!(net.writer_dids(&alice, &space).await, vec![bob.did.clone()]);
+}
+
+/// notifyRepoUpdate: "rejects a rev that is not a TID before any auth check"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn notify_write_rejects_a_rev_that_is_not_a_tid() {
     let net = Net::new(1).await;
     let (alice, bob) = (net.actor("alice", 0).await, net.actor("bob", 1).await);
     let space = net.create_space(&alice, SpaceOpts { members: &[&bob], ..Default::default() }).await;
     let body = notify_body(&space, &bob.did, "not-a-tid", &LtHash::default().digest());
-    let r = Xrpc::new(&net.pds[0].url).post(NOTIFY_WRITE, &body, &Auth::None).await;
+    let r = Xrpc::new(&net.pds[0].url).post(NOTIFY_REPO_UPDATE, &body, &Auth::None).await;
     r.err(400, "InvalidRequest");
     refused_mentioning(&notify(&net, &bob, None, body).await, &["tid"]);
 }
@@ -923,7 +985,12 @@ impl Outbox {
     }
 
     fn sends(&self, space: &str) -> Vec<J> {
-        self.host.calls_to(NOTIFY_WRITE).into_iter().map(|c| c.body).filter(|b| b["space"] == json!(space)).collect()
+        self.host
+            .calls_to(NOTIFY_REPO_UPDATE)
+            .into_iter()
+            .map(|c| c.body)
+            .filter(|b| b["space"] == json!(space))
+            .collect()
     }
 
     async fn await_rev(&self, space: &str, rev: &str) -> bool {
@@ -995,7 +1062,7 @@ async fn outbox_keeps_retryable_refusals_and_drops_permanent_ones() {
         write(&w, space, W::new()).await.ok();
         retry("the send", || {
             std::future::ready(
-                host.calls_to(NOTIFY_WRITE).iter().any(|c| c.body["space"] == json!(space)).then_some(()),
+                host.calls_to(NOTIFY_REPO_UPDATE).iter().any(|c| c.body["space"] == json!(space)).then_some(()),
             )
         })
         .await;
@@ -1008,7 +1075,7 @@ async fn outbox_keeps_retryable_refusals_and_drops_permanent_ones() {
     let _second = cluster_node("ob", store, 8, |c| c.spaces = true).await;
     tokio::time::sleep(Duration::from_secs(3)).await;
     for (space, code, name, again) in &cases {
-        let n = host.calls_to(NOTIFY_WRITE).iter().filter(|c| c.body["space"] == json!(space)).count();
+        let n = host.calls_to(NOTIFY_REPO_UPDATE).iter().filter(|c| c.body["space"] == json!(space)).count();
         assert_eq!(n, if *again { 2 } else { 1 }, "HTTP {code} {name}: sends");
     }
 }
@@ -1027,11 +1094,12 @@ async fn outbox_persists_a_send_that_never_reached_the_host() {
     write(&w, &space, W::new()).await.ok();
     let (rev, _) = repo_state(&w, &space).await.unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(host.calls_to(NOTIFY_WRITE).is_empty());
+    assert!(host.calls_to(NOTIFY_REPO_UPDATE).is_empty());
     vlpds::server::shutdown(&first.app).await;
     host.serve_doc(true);
     let _second = cluster_node("op", store, 8, |c| c.spaces = true).await;
-    let got = host.await_calls(NOTIFY_WRITE, 1, Duration::from_secs(15)).await.expect("delivered after the restart");
+    let got =
+        host.await_calls(NOTIFY_REPO_UPDATE, 1, Duration::from_secs(15)).await.expect("delivered after the restart");
     assert_eq!(got[0].body["repoRev"], json!(rev));
 }
 
@@ -1136,14 +1204,14 @@ async fn outbox_defers_inactive_accounts_and_resumes_on_activation() {
     let w = SpaceClient::new(&first, "oiw", FULL_SCOPE).await;
     let space = format!("at://{}/space/{TEST_SPACE_TYPE}/inactive", host.did);
     write(&w, &space, W::new()).await.ok();
-    host.await_calls(NOTIFY_WRITE, 1, Duration::from_secs(10)).await.expect("first send");
+    host.await_calls(NOTIFY_REPO_UPDATE, 1, Duration::from_secs(10)).await.expect("first send");
     let session = Auth::Bearer(w.session_jwt.clone());
     first.xrpc.post("com.atproto.server.deactivateAccount", &json!({}), &session).await.ok();
     vlpds::server::shutdown(&first.app).await;
     host.respond(200, json!({}));
     let second = cluster_node("oi", store, 8, |c| c.spaces = true).await;
     tokio::time::sleep(Duration::from_secs(2)).await;
-    assert_eq!(host.calls_to(NOTIFY_WRITE).len(), 1, "sent for a deactivated account");
+    assert_eq!(host.calls_to(NOTIFY_REPO_UPDATE).len(), 1, "sent for a deactivated account");
     let session = second.create_session(&w.did, oauth_password()).await.ok();
     second
         .xrpc
@@ -1154,7 +1222,7 @@ async fn outbox_defers_inactive_accounts_and_resumes_on_activation() {
         )
         .await
         .ok();
-    host.await_calls(NOTIFY_WRITE, 2, Duration::from_secs(15)).await.expect("resumed on activation");
+    host.await_calls(NOTIFY_REPO_UPDATE, 2, Duration::from_secs(15)).await.expect("resumed on activation");
 }
 
 fn oauth_password() -> &'static str {
@@ -1171,13 +1239,104 @@ async fn remove_writer_drops_it_until_it_writes_again() {
     let space = net.create_space(&alice, opts).await;
     write(&bob, &space, W::new().text("before removal")).await.ok();
     net.await_writer(&alice, &space, &bob.did).await;
+    let cred = net.credential_for(&alice, &space).await;
+    let list = |q: Vec<(&'static str, String)>| {
+        let (cred, url) = (&cred, net.pds[0].url.clone());
+        async move {
+            let q: Vec<(&str, &str)> = q.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            cred.get(&url, "com.atproto.space.listWriters", &q).await.ok()
+        }
+    };
+    let before = list(vec![("space", space.clone())]).await;
     remove_writer(&alice, &space, &bob).await.ok();
     assert!(net.writer_dids(&alice, &space).await.is_empty());
+    // listed as removed at a new spaceRev, so a syncer catching up from
+    // its cursor learns of it
+    let cursor = before["cursor"].as_str().unwrap().to_string();
+    let caught_up = list(vec![("space", space.clone()), ("cursor", cursor)]).await;
+    assert_eq!(
+        caught_up["repos"],
+        json!([{"$type": "com.atproto.space.defs#repoRemoved", "repo": bob.did, "spaceRev": caught_up["cursor"]}])
+    );
     // idempotent
     remove_writer(&alice, &space, &bob).await.ok();
+    assert_eq!(list(vec![("space", space.clone())]).await["cursor"], caught_up["cursor"]);
     // publicWrite still admits bob, so his next write tracks him again
     write(&bob, &space, W::new().text("after removal")).await.ok();
     assert_eq!(net.await_writer(&alice, &space, &bob.did).await, vec![bob.did.clone()]);
+    let back = list(vec![("space", space.clone())]).await;
+    assert_eq!(back["repos"][0]["$type"], json!("com.atproto.space.defs#repoWrite"));
+}
+
+/// writer set: "ignores removeWriter for a repo outside the writer set"
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remove_writer_ignores_a_repo_outside_the_writer_set() {
+    let net = Net::new(1).await;
+    let (alice, bob, dan) = (net.actor("alice", 0).await, net.actor("bob", 1).await, net.actor("dan", 0).await);
+    let space = net.create_space(&alice, SpaceOpts { members: &[&bob, &dan], ..Default::default() }).await;
+    write(&dan, &space, W::new()).await.ok();
+    net.await_writer(&alice, &space, &dan.did).await;
+    remove_writer(&alice, &space, &dan).await.ok();
+    let cred = net.credential_for(&alice, &space).await;
+    let q = [("space", space.as_str())];
+    let list = || cred.get(&net.pds[0].url, "com.atproto.space.listWriters", &q);
+    let before = list().await.ok();
+    // neither a repo that never wrote nor one already removed changes the
+    // writer set, so neither advances the space sequence
+    remove_writer(&alice, &space, &bob).await.ok();
+    remove_writer(&alice, &space, &dan).await.ok();
+    assert_eq!(list().await.ok(), before);
+}
+
+/// sync: "returns the space's current revision on each authorization"
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn authorization_returns_the_space_rev() {
+    let net = Net::new(2).await;
+    let (alice, dan, carol) = (net.actor("alice", 0).await, net.actor("dan", 0).await, net.actor("carol", 2).await);
+    let space = net.create_space(&alice, SpaceOpts { members: &[&dan, &carol], ..Default::default() }).await;
+    let authorize = || async {
+        let token = delegation_token(&carol, &space).await;
+        net.mint_credential(&space, &token, None).await.0.ok()
+    };
+    assert!(authorize().await.get("spaceRev").is_none());
+    write(&dan, &space, W::new()).await.ok();
+    net.await_writer(&alice, &space, &dan.did).await;
+    let cred = net.credential_for(&carol, &space).await;
+    let written = cred.get(&net.pds[0].url, "com.atproto.space.listWriters", &[("space", &space)]).await.ok();
+    assert_eq!(authorize().await["spaceRev"], written["cursor"]);
+    // a removal advances it: the spaceRev never goes backward
+    remove_writer(&alice, &space, &dan).await.ok();
+    let removed = cred.get(&net.pds[0].url, "com.atproto.space.listWriters", &[("space", &space)]).await.ok();
+    assert!(removed["cursor"].as_str() > written["cursor"].as_str(), "{removed}");
+    assert_eq!(authorize().await["spaceRev"], removed["cursor"]);
+}
+
+/// sync: "forwards a removal from the writer set, in the space sequence"
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forwards_a_removal_in_the_space_sequence() {
+    let net = Net::new(2).await;
+    let (alice, dan, carol) = (net.actor("alice", 0).await, net.actor("dan", 0).await, net.actor("carol", 2).await);
+    let syncer = MockService::syncer().await;
+    let space = net.create_space(&alice, SpaceOpts { members: &[&dan, &carol], ..Default::default() }).await;
+    net.register(&carol, &space, syncer.notify()).await.ok();
+    write(&dan, &space, W::new()).await.ok();
+    net.await_writer(&alice, &space, &dan.did).await;
+    remove_writer(&alice, &space, &dan).await.ok();
+    syncer.await_calls(NOTIFY_SPACE_UPDATE, 2, Duration::from_secs(10)).await.expect("both");
+    let updates = syncer.updates();
+    let write = updates.iter().find(|u| u["$type"] == json!("com.atproto.space.defs#repoWrite")).unwrap();
+    let removal = updates.iter().find(|u| u["$type"] == json!("com.atproto.space.defs#repoRemoved")).unwrap();
+    let cred = net.credential_for(&carol, &space).await;
+    let listed = cred.get(&net.pds[0].url, "com.atproto.space.listWriters", &[("space", &space)]).await.ok();
+    assert_eq!(
+        *removal,
+        json!({
+            "$type": "com.atproto.space.defs#repoRemoved",
+            "repo": dan.did,
+            "spaceRev": listed["cursor"],
+            "prevSpaceRev": write["spaceRev"],
+        })
+    );
 }
 
 /// writer set: "refuses removeWriter from anyone but the authority"
@@ -1188,7 +1347,7 @@ async fn remove_writer_is_the_authoritys_alone() {
     let space = net.create_space(&alice, SpaceOpts { members: &[&dan], ..Default::default() }).await;
     write(&dan, &space, W::new().text("still tracked")).await.ok();
     net.await_writer(&alice, &space, &dan.did).await;
-    remove_writer(&dan, &space, &dan).await.err(400, "NotSpaceOwner");
+    remove_writer(&dan, &space, &dan).await.err(400, "NotAuthorized");
     assert_eq!(net.writer_dids(&alice, &space).await, vec![dan.did.clone()]);
 }
 

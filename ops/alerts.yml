@@ -1235,7 +1235,7 @@ groups:
   # ---------------------------------------------------------------------------
   - name: vlpds-spaces
     rules:
-      # A node's oldest notifyWrite outbox row has waited over an hour: some
+      # A node's oldest notifyRepoUpdate outbox row has waited over an hour: some
       # authority hasn't acknowledged a write for that long. Retries back off
       # from 1 min to 1 h and give up 24 h after the rev was owed, so an hour means
       # several failed sends in a row (design: the retry schedule).
@@ -1245,7 +1245,7 @@ groups:
         labels:
           severity: ticket
         annotations:
-          summary: "{{ $labels.instance }}: a space write has waited {{ $value | humanizeDuration }} for its authority's notifyWrite ack"
+          summary: "{{ $labels.instance }}: a space write has waited {{ $value | humanizeDuration }} for its authority's notifyRepoUpdate ack"
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsspaceoutboxbacklog"
 
       # A space repo's stored head disagreed with the set hash recomputed

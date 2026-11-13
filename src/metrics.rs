@@ -608,10 +608,10 @@ lazy!(SPACE_WRITES: IntCounterVec = register_int_counter_vec!("vlpds_space_write
 lazy!(SPACE_READS: IntCounterVec = register_int_counter_vec!("vlpds_space_reads_total", "Space repo reads by method and auth (credential: a space credential; oauth: the account's own read)", &["method", "auth"]));
 lazy!(SPACE_LIST_REPO_OPS: IntCounterVec = register_int_counter_vec!("vlpds_space_list_repo_ops_total", "listRepoOps answered by path (noop: since was the head, served from memory; scan: an oplog range scan)", &["path"]));
 lazy!(SPACE_LIST_REPO_OPS_SECONDS: HistogramVec = register_histogram_vec!("vlpds_space_list_repo_ops_seconds", "listRepoOps server time by path, auth excluded", &["path"], latency_buckets()));
-lazy!(SPACE_NOTIFY: IntCounterVec = register_int_counter_vec!("vlpds_space_notify_total", "notifyWrite hops by direction (out: this node's writes to their authorities; in: received as an authority; fanout: forwarded to syncers) and result", &["hop", "result"]));
+lazy!(SPACE_NOTIFY: IntCounterVec = register_int_counter_vec!("vlpds_space_notify_total", "Space notification hops by direction (out: notifyRepoUpdate, this node's writes to their authorities; in: notifyRepoUpdate received as an authority; fanout: notifySpaceUpdate updates forwarded to syncers; notice: deletion and expiry notices first sent to syncers) and result", &["hop", "result"]));
 lazy!(SPACE_NOTIFY_ACK: Histogram = register_histogram!("vlpds_space_notify_ack_seconds", "A space write's ack to its authority's acknowledgement of the notify", exponential_buckets(0.001, 2.0, 24).unwrap()));
-lazy!(SPACE_OUTBOX_ROWS: IntGauge = register_int_gauge!("vlpds_space_outbox_rows", "notifyWrite outbox rows this node owes (one per repo and space)"));
-lazy!(SPACE_OUTBOX_OLDEST: Gauge = register_gauge!("vlpds_space_outbox_oldest_seconds", "Age of the oldest notifyWrite outbox row, leaving out rows held for an inactive writer"));
+lazy!(SPACE_OUTBOX_ROWS: IntGauge = register_int_gauge!("vlpds_space_outbox_rows", "notifyRepoUpdate outbox rows this node owes (one per repo and space)"));
+lazy!(SPACE_OUTBOX_OLDEST: Gauge = register_gauge!("vlpds_space_outbox_oldest_seconds", "Age of the oldest notifyRepoUpdate outbox row, leaving out rows held for an inactive writer"));
 lazy!(SPACE_DELEGATIONS: IntCounter = register_int_counter!("vlpds_space_delegations_total", "Delegation tokens minted (getDelegationToken)"));
 lazy!(SPACE_CREDENTIAL_CACHE: IntCounterVec = register_int_counter_vec!("vlpds_space_credential_cache_total", "Space credential verifications by cache result (hit: a verified credential, only the request signature checked; miss: the whole chain)", &["result"]));
 lazy!(SPACE_CREDENTIAL_CHECKS: IntCounterVec = register_int_counter_vec!("vlpds_space_credential_checks_total", "Space credential checks by result (ok, bad_sig, expired, revoked, audience, space)", &["result"]));
@@ -619,12 +619,12 @@ lazy!(SPACE_REVOCATIONS: IntGauge = register_int_gauge!("vlpds_space_revocations
 lazy!(SPACE_REVOCATIONS_SATURATED: IntGauge = register_int_gauge!("vlpds_space_revocations_saturated", "1 while the revocation blocks are saturated: every remote space authority's credentials are refused (local ones keep working)"));
 lazy!(SPACE_REVOCATION_BLOCKS: IntGaugeVec = register_int_gauge_vec!("vlpds_space_revocation_blocks", "Spaces and authorities whose credentials are refused because a revocation of theirs couldn't be stored, by kind (space, authority)", &["kind"]));
 lazy!(SPACE_FANOUT_DEPTH: IntGauge = register_int_gauge!("vlpds_space_fanout_queue_depth", "Write notifications waiting to be forwarded to registered services, across lanes"));
-lazy!(SPACE_FANOUT_DROPPED: IntCounterVec = register_int_counter_vec!("vlpds_space_fanout_dropped_total", "Write notifications not forwarded to a registered service, by reason (queue_full: the dispatcher's queue; lane_full: the oldest of a (space, service) lane; host_full: the service host's queue; all_full: every lane's queues together; lanes_full: no room for another lane; gave_up: retries ran out; expired: the registration expired while failing; takendown: the space is taken down). The service sees a prevSpaceRev gap and catches up with listRepos", &["reason"]));
+lazy!(SPACE_FANOUT_DROPPED: IntCounterVec = register_int_counter_vec!("vlpds_space_fanout_dropped_total", "Writer-set updates not forwarded to a registration, by reason (queue_full: the dispatcher's queue; lane_full: the oldest of a (space, registration) lane; host_full: the endpoint host's queue; all_full: every lane's queues together; lanes_full: no room for another lane; gave_up: retries ran out; expired: the registration lapsed while failing; takendown: the space is taken down). The syncer sees a prevSpaceRev gap and catches up with listWriters", &["reason"]));
 lazy!(SPACE_FANOUT_COALESCED: IntCounter = register_int_counter!("vlpds_space_fanout_coalesced_total", "Write notifications replaced before they were sent by a newer one of the same writer to the same service"));
-lazy!(SPACE_OUTBOX_OVERFLOW: IntCounter = register_int_counter!("vlpds_space_outbox_overflow_total", "notifyWrite outbox rows left in the bucket because the in-memory outbox was full (picked up by a rescan once it drains)"));
+lazy!(SPACE_OUTBOX_OVERFLOW: IntCounter = register_int_counter!("vlpds_space_outbox_overflow_total", "notifyRepoUpdate outbox rows left in the bucket because the in-memory outbox was full (picked up by a rescan once it drains)"));
 lazy!(SPACE_EXPORT_BYTES: Histogram = register_histogram!("vlpds_space_export_bytes", "Memory a space getRepo export holds: the chunk it fills", exponential_buckets(65536.0, 2.0, 16).unwrap()));
 lazy!(SPACE_OPLOG_PRUNED: IntCounter = register_int_counter!("vlpds_space_oplog_pruned_total", "Space oplog ops deleted past --space-oplog-retention"));
-lazy!(SPACE_CREDENTIALS_ISSUED: IntCounterVec = register_int_counter_vec!("vlpds_space_credentials_issued_total", "getSpaceCredential answers as a space authority, by result", &["result"]));
+lazy!(SPACE_CREDENTIALS_ISSUED: IntCounterVec = register_int_counter_vec!("vlpds_space_credentials_issued_total", "authorizeSpaceSync answers as a space authority, by result", &["result"]));
 
 pub fn space_write(op: &str, result: &str) {
     SPACE_WRITES.with_label_values(&[op, result]).inc();
@@ -726,7 +726,7 @@ pub fn space_operator_read(method: &str) {
 /// With `--spaces`: the series its alerts and dashboard row read, at 0
 /// before their first event (a node without the flag exports none).
 pub fn init_space_counters() {
-    for hop in ["out", "in", "fanout"] {
+    for hop in ["out", "in", "fanout", "notice"] {
         let results: &[&str] = match hop {
             "out" => &["ok", "refused", "gone", "expired", "retry", "wait"],
             "in" => &["ok", "noop", "refused", "error", "same_rev_capped", "same_rev_unverified"],

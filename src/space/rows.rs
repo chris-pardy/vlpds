@@ -1,7 +1,8 @@
 //! Values of the Spaces state families (keys: `crate::state`, "Spaces").
 //! Binary rows are fixed-order fields with u16 length prefixes; `sS` is
-//! JSON, as the rows an operator may want to read are. Records (`sR`) use
-//! the public `R/` value (`state::record_value`).
+//! JSON, as the rows an operator may want to read are, and so is `sY`
+//! (`space::notices::NoticeRow`). Records (`sR`) use the public `R/` value
+//! (`state::record_value`).
 
 use super::lthash::{LtHash, STATE_BYTES};
 use anyhow::{bail, ensure, Context};
@@ -155,7 +156,7 @@ pub fn seq_rev(key: &[u8]) -> Option<Tid> {
     Some(Tid(u64::from_be_bytes(tail.try_into().ok()?)))
 }
 
-/// `sQ`: a writer in listRepos order, with the spaceRev sequenced just
+/// `sQ`: a writer in listWriters order, with the spaceRev sequenced just
 /// before it. That one's row may be gone (its writer wrote again), and a
 /// forward naming anything else as its prevSpaceRev could fork the chain a
 /// syncer already heard.
@@ -229,8 +230,8 @@ pub fn did_sid(key: &[u8]) -> Option<(&str, crate::state::SpaceId)> {
     Some((std::str::from_utf8(&body[..at]).ok()?, body[at + 1..].try_into().ok()?))
 }
 
-/// The DID and space id that begin a key with more after them (`sN`'s
-/// service, `sW`'s writer).
+/// The DID and space id that begin a key with more after them (`sG`'s
+/// registration, `sW`'s writer).
 pub fn did_sid_head(key: &[u8]) -> Option<(&str, crate::state::SpaceId)> {
     let body = vlsync_store::keys::key_body(key).get(3..)?;
     let at = body.iter().position(|b| *b == 0)?;
@@ -238,22 +239,31 @@ pub fn did_sid_head(key: &[u8]) -> Option<(&str, crate::state::SpaceId)> {
     Some((std::str::from_utf8(&body[..at]).ok()?, sid.try_into().ok()?))
 }
 
-/// `sW`: a writer's latest state as its repo host reported it.
+/// `sW`: a writer's latest state as its repo host reported it, or its
+/// removal from the writer set (reference `space_writer.removedAt`): the
+/// row stays, at the removal's spaceRev, so listWriters reports it until
+/// the repo writes again. A removed row is one byte longer (a trailing 1);
+/// rows from before removals were sequenced are 48 bytes and never removed
+/// (a removal then deleted the row).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WriterRow {
     pub repo_rev: Tid,
     pub hash: [u8; 32],
     pub space_rev: Tid,
+    pub removed: bool,
 }
 
 impl WriterRow {
     pub const LEN: usize = 48;
 
     pub fn encode(&self) -> Bytes {
-        let mut b = Vec::with_capacity(Self::LEN);
+        let mut b = Vec::with_capacity(Self::LEN + 1);
         b.put_u64(self.repo_rev.0);
         b.put_slice(&self.hash);
         b.put_u64(self.space_rev.0);
+        if self.removed {
+            b.put_u8(1);
+        }
         b.into()
     }
 
@@ -262,8 +272,13 @@ impl WriterRow {
         let repo_rev = Tid(r.u64()?);
         let hash = r.take(32)?.try_into()?;
         let space_rev = Tid(r.u64()?);
+        let removed = match v.len() {
+            Self::LEN => false,
+            _ if r.u8()? == 1 => true,
+            _ => bail!("bad writer row"),
+        };
         r.end()?;
-        Ok(WriterRow { repo_rev, hash, space_rev })
+        Ok(WriterRow { repo_rev, hash, space_rev, removed })
     }
 }
 
@@ -287,7 +302,10 @@ impl MemberRow {
     }
 }
 
-/// `sN`: a service registered for the space's write notifications.
+/// `sN`: a Nov 5 registerNotify registration (a service's endpoint and
+/// expiry, keyed by the service). Never read or written by the server now
+/// (`space::notices` deletes the rows); kept so the format fixtures of the
+/// levels that wrote it still decode.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NotifyRow {
     pub endpoint: String,
@@ -309,6 +327,53 @@ impl NotifyRow {
         let expires = r.u64()?;
         r.end()?;
         Ok(NotifyRow { endpoint, expires })
+    }
+}
+
+/// `sG`: an endpoint registered for the space's notifications through
+/// authorizeSpaceSync (reference `space_notify_registration`), identified
+/// by its endpoint and token together (`state::reg_id`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegistrationRow {
+    pub endpoint: String,
+    pub token: String,
+    /// When the credential from its latest authorization expires (unix µs).
+    pub expires: u64,
+    /// The lapsed registration was claimed for its expiry notice. After
+    /// that it's sent nothing but a deletion notice until it's renewed.
+    pub expiry_notified: bool,
+}
+
+impl RegistrationRow {
+    pub fn encode(&self) -> Bytes {
+        let mut b = Vec::with_capacity(13 + self.endpoint.len() + self.token.len());
+        put_str(&mut b, &self.endpoint);
+        put_str(&mut b, &self.token);
+        b.put_u64(self.expires);
+        b.put_u8(self.expiry_notified as u8);
+        b.into()
+    }
+
+    pub fn decode(v: &[u8]) -> anyhow::Result<RegistrationRow> {
+        let mut r = Reader::new(v);
+        let endpoint = r.str()?.to_string();
+        let token = r.str()?.to_string();
+        let expires = r.u64()?;
+        let expiry_notified = match r.u8()? {
+            0 => false,
+            1 => true,
+            _ => bail!("bad registration row"),
+        };
+        r.end()?;
+        Ok(RegistrationRow { endpoint, token, expires, expiry_notified })
+    }
+
+    pub fn id(&self) -> crate::state::RegId {
+        crate::state::reg_id(&self.endpoint, &self.token)
+    }
+
+    pub fn lapsed(&self, now: u64) -> bool {
+        self.expires <= now
     }
 }
 
@@ -342,6 +407,18 @@ pub const MANAGEDSPACE: &str = "com.atproto.managedspace.policy";
 pub enum PolicyError {
     Unsupported(String),
     Invalid(String),
+}
+
+/// Reference `isAtprotoDidRefAbsolute`: a did:plc or did:web, then one
+/// `#` and a non-empty URI fragment. Policies stored before the Nov 12
+/// alpha may hold a bare DID (its PDS); they're read as they are.
+pub fn did_service_ref(s: &str) -> bool {
+    let Some((did, frag)) = s.split_once('#') else { return false };
+    let fragment_char = |c: char| c.is_ascii_alphanumeric() || "-._~!$&'()*+,;=:@/?%".contains(c);
+    !frag.is_empty()
+        && frag.chars().all(fragment_char)
+        && (did.starts_with("did:plc:") || did.starts_with("did:web:"))
+        && vlatproto::syntax::valid_did(did)
 }
 
 impl Policy {
@@ -381,10 +458,9 @@ impl Policy {
             }
             MANAGEDSPACE => {
                 let app = v.get("managingApp").and_then(|a| a.as_str()).unwrap_or("");
-                let did = app.split_once('#').map_or(app, |(d, _)| d);
-                if !vlatproto::syntax::valid_did(did) {
+                if !did_service_ref(app) {
                     return Err(PolicyError::Invalid(format!(
-                        "managingApp must be a DID with an optional service fragment, got: {app}"
+                        "managingApp must be a did#serviceId reference, got: {app}"
                     )));
                 }
                 Ok(Policy::Managed { managing_app: app.into(), publish_policy: flag("publishPolicy") })
@@ -408,12 +484,6 @@ impl Policy {
     /// Only a memberspace keeps a member list.
     pub fn is_memberspace(&self) -> bool {
         matches!(self, Policy::Member { .. })
-    }
-
-    /// Reference `isPublicRead`: only then is a credential minted without a
-    /// delegation token saying who the user is.
-    pub fn public_read(&self) -> bool {
-        matches!(self, Policy::Member { public_read: true, .. })
     }
 
     pub fn publishes_policy(&self) -> bool {
@@ -509,7 +579,7 @@ fn legacy_config(p: &Policy) -> (LegacyPolicy, LegacyPolicy, LegacyAppAccess) {
 }
 
 /// `sS`: a space this account governs. A deleted one stays as a tombstone
-/// (`deleted_at`), so getSpaceCredential can answer `SpaceDeleted`.
+/// (`deleted_at`), so authorizeSpaceSync can answer `SpaceDeleted`.
 ///
 /// A row written before space policies holds the simplespace config
 /// (`readPolicy`, `writePolicy`, `appAccess`) instead of `policy`: it
@@ -625,10 +695,25 @@ mod tests {
         }
         let o = OutboxRow { uri: "at://x".into(), repo_rev: Tid(5), hash: [3; 32] };
         assert_eq!(OutboxRow::decode(&o.encode()).unwrap(), o);
-        let n = NotifyRow { endpoint: "https://syncer.example".into(), expires: 9 };
-        assert_eq!(NotifyRow::decode(&n.encode()).unwrap(), n);
-        let w = WriterRow { repo_rev: Tid(1), hash: [2; 32], space_rev: Tid(3) };
-        assert_eq!(WriterRow::decode(&w.encode()).unwrap(), w);
+        for expiry_notified in [false, true] {
+            let n = RegistrationRow {
+                endpoint: "https://syncer.example".into(),
+                token: "t0k".into(),
+                expires: 9,
+                expiry_notified,
+            };
+            assert_eq!(RegistrationRow::decode(&n.encode()).unwrap(), n);
+        }
+        for removed in [false, true] {
+            let w = WriterRow { repo_rev: Tid(1), hash: [2; 32], space_rev: Tid(3), removed };
+            assert_eq!(WriterRow::decode(&w.encode()).unwrap(), w);
+        }
+        // a writer row from before removals were sequenced
+        let w = WriterRow { repo_rev: Tid(1), hash: [2; 32], space_rev: Tid(3), removed: false };
+        assert_eq!(w.encode().len(), WriterRow::LEN);
+        let mut bad = w.encode().to_vec();
+        bad.push(2);
+        assert!(WriterRow::decode(&bad).is_err());
         for prev in [None, Some(Tid(4))] {
             let q = SeqRow { prev, writer: "did:plc:w".into() };
             assert_eq!(SeqRow::decode(&q.encode()).unwrap(), q);
@@ -778,10 +863,22 @@ mod tests {
             p(serde_json::json!({"$type": MANAGEDSPACE, "managingApp": "did:web:x.example#forum", "other": true})),
             Ok(Policy::Managed { managing_app: "did:web:x.example#forum".into(), publish_policy: false })
         );
-        assert!(matches!(
-            p(serde_json::json!({"$type": MANAGEDSPACE, "managingApp": "nope"})),
-            Err(PolicyError::Invalid(_))
-        ));
+        // a did#serviceId reference since the Nov 12 alpha: no bare DID
+        for bad in ["nope", "did:web:x.example", "did:web:x.example#", "did:key:zQ3sh#x", "did:web:x.example#a#b"] {
+            assert!(
+                matches!(
+                    p(serde_json::json!({"$type": MANAGEDSPACE, "managingApp": bad})),
+                    Err(PolicyError::Invalid(_))
+                ),
+                "{bad}"
+            );
+        }
+        // a stored row from before keeps its bare DID
+        let old: Policy = serde_json::from_value(
+            serde_json::json!({"$type": MANAGEDSPACE, "managingApp": "did:web:x.example", "publishPolicy": false}),
+        )
+        .unwrap();
+        assert_eq!(old, Policy::Managed { managing_app: "did:web:x.example".into(), publish_policy: false });
         assert!(matches!(p(serde_json::json!({"$type": "com.example.policy"})), Err(PolicyError::Unsupported(_))));
         assert_eq!(
             Policy::member_defaults().to_lex(),

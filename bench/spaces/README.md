@@ -13,7 +13,9 @@ just spaces-cost vlpds warm-writes   # only the warm write-latency step (ref-a f
 ```
 
 `just spaces-boards` runs boards, a Reddit-like private board app on Spaces, through its user stories,
-and `just spaces-boards-ui` serves its web UI on this stack (boards/README.md).
+and `just spaces-boards-ui` serves its web UI on this stack (boards/README.md). The boards modes need
+the boards app itself (`packages/boards` beside this package in the monorepo, or `BOARDS_DIR`); it
+isn't in this repository, and it is still on the Nov 5 wire.
 
 Everything runs on this machine, and nothing talks to the real PLC, a relay or bsky. Accounts,
 passwords and keys are generated per run (or are fixed test values in this directory).
@@ -24,10 +26,11 @@ passwords and keys are generated per run (or are fixed test values in this direc
 
 - A PLC directory on `127.0.0.1:2860` (the `did-method-plc` image bench/migrate builds).
 - Two reference PDSes, `ref-a` on `localhost:2861` and `ref-b` on `localhost:2862`. They're built by
-  `refpds.sh` from bluesky-social/atproto at the pin `98ef3a6b` (branch `permissioned-data`, the
-  wire of the `0.0.0-spaces-alpha-20261105160032` npm release), cloned blobless into
-  `.scratch/atproto`. The published `pds-spaces-alpha` image has the same packages but is amd64
-  only, so it doesn't run here. Set `REF_PDS_IMAGE` to use it on a host that can.
+  `refpds.sh` from bluesky-social/atproto at the pin `d4def6e9` (the wire of the
+  `0.0.0-spaces-alpha-20261112204144` npm release), cloned blobless into `.scratch/atproto`, with
+  the pin's own root Dockerfile (`--target pds`). The published `pds-spaces-alpha` image is built
+  from `b27a037c` (the pin merged with main) and is amd64 only, so it doesn't run here. Set
+  `REF_PDS_IMAGE` to use it on a host that can.
 - MinIO on `127.0.0.1:2868` (the repo's `vlpds-minio:local` image). vlpds keeps its state there, so a
   `kill -9` loses nothing that was acked and the bucket's request counters are there to read.
 
@@ -98,29 +101,39 @@ bench/spaces/r2-clean.sh bench/<run-id>          # afterwards, with the prefix r
 
 ## How the driver acts like an app
 
-The wire is what a real app sends. Calls go through `@atproto/api` at the Spaces alpha
-(`0.0.0-spaces-alpha-20261105160032`), which also validates every response against the lexicons.
-Credentials, HTTP message signatures, KEM encapsulation, MACs, LtHash and STAR verification come
-from `@atproto/space` at the same version.
+The wire is what a real app sends. Account calls go through `@atproto/api` at the Spaces alpha
+(`0.0.0-spaces-alpha-20261112204144`). That release left the space methods out of `@atproto/api`
+(they went to `@atproto/lex-space`, which hides the wire this harness checks), so `lib/xrpc.mjs`
+drives `com.atproto.{space,memberspace,managedspace}.*` from the vendored lexicons
+(`lexicons/spaces-alpha`) and validates every request's params and every JSON answer against
+them. Credentials, HTTP message signatures, HPKE encapsulation, MACs, LtHash and STAR verification
+come from `@atproto/space` at the same version. The credential chain and the syncer
+(`lib/space.mjs`, `lib/syncer.mjs`) came from the boards app's Spaces client through the Nov 5
+alpha, and live here now.
 
 - On a reference PDS the driver uses a password session, as the reference's own tests do.
 - vlpds only takes OAuth for spaces, so each vlpds account also authorizes a loopback client
   headlessly (`lib/oauth.mjs`: PAR, PKCE, the sign-in and consent forms, DPoP). The scope asks for
   every space action on `com.example.group` at any authority, plus `blob:*/*`, `repo:*` and the two
   `rpc:` grants the revocation and notify tests need (`APP_SCOPE` in `lib/actor.mjs`).
-- A credential is requested with a body (`space`, `credentialKid`, `delegationToken`) at the
-  authority's `#atproto_pds`, and presented as `Authorization: Atproto-Space-Credential` with a
-  tagged RFC 9421 signature.
-- A syncer (`lib/syncer.mjs`) gets credentials through a read-only member's delegation token. It
-  catches up with `listRepos` from a spaceRev checkpoint and pulls each repo from its own host with
-  `listRepoOps`. Every getLatestCommit, getRepo, listRepoOps and getRecord it sends carries
-  `Atproto-Space-Want-Mac` with a key share encapsulated afresh to the author's `#atproto_kem` key,
-  and a commit counts only once the response's `Atproto-Space-Mac` verifies. It keeps a running
-  LtHash per repo and checks it against the commit's `data`, falling back to a verified STAR
-  `getRepo` on a mismatch (which is also how it sees a `clearRecords`).
-- Forwarded notifications land on `lib/notifysvc.mjs`. It's a real did:plc whose
-  `#atproto_space_syncer` entry points at it, and it checks each call's service auth against the
-  authority's key. It also answers `com.atproto.managedspace.checkUserAccess` as a managing app.
+- A credential comes from `authorizeSpaceSync` at the authority's `#atproto_pds`, with a body
+  (`space`, `credentialKey`, `delegationToken`, and for a syncer `notify`), and is presented as
+  `Authorization: Atproto-Space-Credential` with an RFC 9421 signature tagged
+  `atproto-space-credential` under the label `sig`.
+- A syncer (`lib/syncer.mjs`) gets credentials through a read-only member's delegation token, and
+  each authorization carries its `notify` endpoint and token, which registers it (or renews the
+  registration). It catches up with `listWriters` from a spaceRev checkpoint and pulls each repo
+  from its own host with `listRepoOps`. Every getLatestCommit, getRepo, listRepoOps and getRecord it
+  sends asks for a MAC in `Accept-Signature`, with a key share encapsulated afresh to the author's
+  `#atproto_kem` key, and a commit counts only once the `Atproto-Space-Commit` header's
+  `hmac-sha256` signature verifies. It keeps a running LtHash per repo and checks it against the
+  commit's `data`, falling back to a verified STAR `getRepo` on a mismatch (which is also how it sees
+  a `clearRecords`). A `repoRemoved` drops the repo, and `registrationExpired` re-authorizes.
+- Space hosts call `lib/notifysvc.mjs` as the registered endpoint: it answers
+  `confirmRegistration` for a token it issued for that space, and takes `notifySpaceUpdate` with the
+  token in the body (no service auth). It also has a real did:plc, so it can be a managedspace's
+  `managingApp` (`<did>#atproto_space_syncer`) and answer `com.atproto.managedspace.checkAccess`,
+  checking that call's service auth against the authority's key.
 
 ## The matrix (e2e)
 
@@ -137,31 +150,42 @@ ref-ref runs first. It checks the harness, so a failure in another column points
 steps cover:
 
 - spaces and policies: createSpace with a memberspace policy and its stored defaults,
-  `UnsupportedPolicy`, members, publicRead with and without a delegation token, allowedApps,
-  managedspace and `checkUserAccess`, personalspace, wholesale `updateSpace` and the member list
+  `UnsupportedPolicy`, `putMembers` (last entry wins) and `removeMembers` (non-members ignored),
+  publicRead with and without a delegation token, allowedApps, managedspace and `checkAccess` (with
+  a repo, and with none for a token-less request), a bare-DID `managingApp` refused, personalspace, wholesale `updateSpace` and the member list
   going with a policy change, `PolicyMismatch`, and published policy and member records
 - record writes (create, put, delete, applyWrites and its atomicity, direct writes to the published
   collections refused), self-reads with an optional MAC
 - the credential chain: claims and `kid`s, `#atproto_pds` audiences, single-use delegation and
   `InvalidDelegationToken`, `SpaceNotFound` for outsiders and token-less requests, a non-P-256
-  `credentialKid`; then the request signature (tag, label next to another, DER refused, high-S and
-  unpadded base64 accepted, a lower-case scheme, the old `Atproto-Space` scheme refused, wrong
-  audience, wrong key) and getSpace refusing a credential
-- MACs: commit and record MACs verified against the author's `#atproto_kem` key, `BadSpaceMac`
-  without the header or with a bad key share, type or version, `Vary` and
-  `Access-Control-Expose-Headers`
-- full and incremental sync with LtHash checks, the STAR archive (end byte, path order, a truncated
-  archive rejected)
-- notify registration and delivery (service auth, `data`, spaceRev and prevSpaceRev order,
-  listRepos paging), `FutureRev` and stale notifies sent straight to the space host, the old
-  `#atproto_space_host` audience refused
+  `credentialKey`, the `spaceRev` in the answer; then the request signature (the `sig` label, found
+  by tag next to another signature and under any label, two tagged ones refused, DER refused,
+  high-S and unpadded base64 accepted, a lower-case scheme, the old `Atproto-Space` scheme refused,
+  wrong audience, wrong key) and getSpace refusing a credential
+- MACs: commit and record MACs (`Accept-Signature`, answered under the requested label as
+  `Atproto-Space-Commit` / `Atproto-Space-Record` with `Signature-Input` and `Signature`) verified
+  against the author's `#atproto_kem` key, `InvalidSpaceMac` without a request, for a bad keyid, an
+  extra parameter, another alg or two requests with the tag, a request with another tag ignored,
+  `Vary` and `Access-Control-Expose-Headers`
+- full and incremental sync with LtHash checks, the STAR archive (`application/vnd.dasl.star`, end
+  byte, path order, a truncated archive rejected), `listRepoOps` with the commit on every page, a
+  cursor when full, `InvalidCursor` and `RepoNotFound`
+- notify registration through `authorizeSpaceSync` (`confirmRegistration` once, renewal without
+  asking again, `RegistrationNotConfirmed` for a refused or wrong challenge) and delivery
+  (`notifySpaceUpdate` with the token and no service auth, `data`, spaceRev and prevSpaceRev order,
+  listWriters paging), `FutureRev` and stale `notifyRepoUpdate`s sent straight to the space host,
+  the old `#atproto_space_host` audience refused, and notes on whether the Nov 5 method names
+  still answer
 - read-only members not being tracked, blobs (the reference rule for `sync.getBlob`), revocation,
   admin takedowns of a writer and of the authority (`RepoTakendown` while held credentials keep
   reading), app passwords
-- the writer set: member removal, `clearRecords` (the empty digest, a syncer resyncing),
-  `removeWriter` and re-tracking
+- the writer set: member removal (`repoRemoved` in listWriters and to the syncer), `clearRecords`
+  (the empty digest, a syncer resyncing), `removeWriter` (listed as removed, left out of
+  `exportSpaceMeta`) and re-tracking
 - `importRepo` (a new rev with the same data, an older archive replacing the repo),
-  `exportSpaceMeta` / `importSpaceMeta`, space deletion and the leak check
+  `exportSpaceMeta` / `importSpaceMeta` (`InvalidRepoFile`, `RepoMismatch`, `InvalidSpaceMeta`),
+  space deletion (`SpaceDeleted` before the request is checked, a `spaceDeleted` notice) and the
+  leak check
 
 Two steps cover vlpds extensions and run only when the writer (and, for the second, the space) is on
 vlpds:
@@ -203,20 +227,20 @@ After the workload it checks these invariants:
 
 - I1: each host holds exactly the acked writes for every repo. Writes whose outcome is unknown (a
   crash or a 5xx) may land either way, and the host's answer is taken for those paths.
-- I2: the authority's `listRepos` has every active writer at its head. This is notify delivery,
+- I2: the authority's `listWriters` has every active writer at its head. This is notify delivery,
   eventually. With faults it waits up to 4 minutes (`CONVERGE_MS`), since dropped notifies are
   retried with backoff.
 - I3: every syncer, after catching up from its checkpoint, holds the acked state of every listed
-  repo, and its LtHash matches the listed data.
+  repo, its LtHash matches the listed data, and it holds nothing for a repo listed as removed.
 - I4: no spaceRev is given to two different updates, and the prevSpaceRev chain never forks.
 - I5: no syncer saw a protocol violation (cursor rules, ordering, a rev going backwards).
 
 `FAULTS=1` (`just spaces-fault`) adds faults during the workload:
 
-- A fault proxy in front of every syncer drops 20% of forwarded notifies (as a 503), duplicates
-  20% and delays them by up to 1.5 s.
+- A fault proxy in front of every syncer's endpoint drops 20% of `notifySpaceUpdate`s (as a 503),
+  duplicates 20% and delays them by up to 1.5 s. `confirmRegistration` passes through.
 - The authority's `#atproto_pds` (its space host) is pointed at a proxy that passes everything
-  through but drops 30% of inbound `notifyWrite`s. That exercises the writer's retry path, which is the outbox on
+  through but drops 30% of inbound `notifyRepoUpdate`s. That exercises the writer's retry path, which is the outbox on
   vlpds.
 - vlpds gets a `kill -9` at a third of the ops and a SIGTERM at two thirds, each restarted right
   away. With `CLUSTER=1`, node 1 is killed and stays down 20 s, so its shards move.
@@ -232,7 +256,7 @@ The proxies heal before the invariants run.
 |---|---|---|
 | no-op poll | 300 `listRepoOps(since=head)`, server time from `vlpds_http_request_duration_seconds` | mean well under 1 ms, 0 bucket ops |
 | delta pull | write one record, then `listRepoOps(since)`, 200 times | a few ms |
-| notify | write, then time to the forwarded `notifyWrite` | p50 under 100 ms locally (no linger) |
+| notify | write, then time to the `notifySpaceUpdate` | p50 under 100 ms locally (no linger) |
 | bucket ops | `vlpds_object_store_requests_total` and MinIO's counters per write, net of idle | space write ≤ public write |
 | public p99 | 300 public writes alone, then with 8 space writers running | within 25% + 2 ms |
 | warm writes | after 30 warmup rounds, `WARM_N` (210) rounds of createRecord, putRecord and a one-op applyWrites in turn, one account in one space | reported, not gated |

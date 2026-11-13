@@ -3294,7 +3294,7 @@ async fn get_service_auth(State(app): AppState, Auth(creds): Auth, Query(q): Que
             )));
         }
     }
-    // A space-method token carries authority (a notifyWrite as a writer, a
+    // A space-method token carries authority (a notifyRepoUpdate as a writer, a
     // revocation as an authority) to another host: OAuth apps get one only
     // with a space: grant covering it, never from transition:generic or rpc:
     // alone, and other credentials never (space data is OAuth-only).

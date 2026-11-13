@@ -84,6 +84,8 @@ pub struct Writer {
     pub repo_rev: Tid,
     pub hash: [u8; 32],
     pub space_rev: Tid,
+    /// Out of the writer set (listed as `repoRemoved`).
+    pub removed: bool,
 }
 
 /// The space host's rows, when the account is the space's authority.
@@ -192,13 +194,19 @@ pub async fn load<R: slatedb::DbReadOps + Sync + ?Sized>(db: &R, did: &str, uri:
         for (k, v) in scan(db, &wp).await? {
             let w = rows::WriterRow::decode(&v).context("a writer row (sW) doesn't decode")?;
             let did = String::from_utf8_lossy(&k[wp.len()..]).into_owned();
-            writers.push(Writer { did, repo_rev: w.repo_rev, hash: w.hash, space_rev: w.space_rev });
+            writers.push(Writer {
+                did,
+                repo_rev: w.repo_rev,
+                hash: w.hash,
+                space_rev: w.space_rev,
+                removed: w.removed,
+            });
         }
         let qp = state::space_prefix(state::SPACE_SEQ_FAMILY, did, &sid);
         let mut seq = Vec::new();
         for (k, v) in scan(db, &qp).await? {
-            let rev = rows::seq_rev(&k).filter(|_| k.len() == qp.len() + 8).context("a bad listRepos (sQ) key")?;
-            let q = rows::SeqRow::decode(&v).context("a listRepos row (sQ) doesn't decode")?;
+            let rev = rows::seq_rev(&k).filter(|_| k.len() == qp.len() + 8).context("a bad listWriters (sQ) key")?;
+            let q = rows::SeqRow::decode(&v).context("a listWriters row (sQ) doesn't decode")?;
             seq.push((rev, q.prev, q.writer));
         }
         out.governs = space.as_ref().is_some_and(|s| s.live() && s.uri == uri);
@@ -419,17 +427,17 @@ pub fn check(did: &str, uri: &str, rows: &Rows, now_us: u64, retention: Option<s
                 p.is_some_and(|p| p >= *t) || floor.is_some_and(|f| p.is_none_or(|p| p < f))
             })
             .count();
-        count(&mut problems, unsequenced, "writer row(s) (sW) without their listRepos row (sQ)");
-        count(&mut problems, stale_seq, "listRepos row(s) (sQ) that aren't their writer's latest");
-        count(&mut problems, bad_prev, "listRepos row(s) (sQ) whose prevSpaceRev is out of order");
+        count(&mut problems, unsequenced, "writer row(s) (sW) without their listWriters row (sQ)");
+        count(&mut problems, stale_seq, "listWriters row(s) (sQ) that aren't their writer's latest");
+        count(&mut problems, bad_prev, "listWriters row(s) (sQ) whose prevSpaceRev is out of order");
         if !h.live && !(h.writers.is_empty() && h.seq.is_empty()) {
             problems.push(format!(
-                "a deleted space keeps {} writer and {} listRepos row(s)",
+                "a deleted space keeps {} writer and {} listWriters row(s)",
                 h.writers.len(),
                 h.seq.len()
             ));
         }
-        let own = writers.get(did).copied();
+        let own = writers.get(did).copied().filter(|w| !w.removed);
         if let (Some(w), Some(hd)) = (own, head) {
             if w.repo_rev != hd.rev || Some(w.hash) != digest {
                 problems.push(format!(
@@ -441,6 +449,7 @@ pub fn check(did: &str, uri: &str, rows: &Rows, now_us: u64, retention: Option<s
         json!({
             "live": h.live,
             "writers": h.writers.len(),
+            "removed": h.writers.iter().filter(|w| w.removed).count(),
             "seq": h.seq.len(),
             "maxSpaceRev": h.seq.iter().map(|(t, ..)| *t).max().map(|t| t.to_string()),
             "unsequenced": unsequenced,
@@ -672,13 +681,13 @@ mod tests {
         let r = check(DID, own, &self_rows, NOW, RET);
         assert!(problems(&r).iter().any(|p| p.contains("governs")), "{r}");
 
-        // the authority's view of its own repo, and listRepos rows
+        // the authority's view of its own repo, and listWriters rows
         let mut rows = healthy();
         rows.head.as_mut().unwrap().uri = own.into();
         let s1 = Tid::from_parts(NOW, 2);
         let s2 = Tid::from_parts(NOW + 1, 2);
-        let me = Writer { did: DID.into(), repo_rev: h.rev, hash: h.hash.digest(), space_rev: s2 };
-        let other = Writer { did: "did:plc:other".into(), repo_rev: s1, hash: [1; 32], space_rev: s1 };
+        let me = Writer { did: DID.into(), repo_rev: h.rev, hash: h.hash.digest(), space_rev: s2, removed: false };
+        let other = Writer { did: "did:plc:other".into(), repo_rev: s1, hash: [1; 32], space_rev: s1, removed: false };
         rows.host = Some(Host {
             live: true,
             writers: vec![me, other.clone()],
@@ -689,13 +698,13 @@ mod tests {
         assert_eq!(r["host"]["maxSpaceRev"], json!(s2.to_string()));
         let mut stale = rows.clone();
         stale.host.as_mut().unwrap().seq.insert(0, (Tid(s1.0 - 1), None, other.did.clone()));
-        assert_problem(&stale, NOW, "1 listRepos row(s) (sQ) that aren't their writer's latest");
+        assert_problem(&stale, NOW, "1 listWriters row(s) (sQ) that aren't their writer's latest");
         let mut unseq = rows.clone();
         unseq.host.as_mut().unwrap().seq.remove(0);
         let mut forked = rows.clone();
         forked.host.as_mut().unwrap().seq[1].1 = Some(Tid(s1.0 - 1));
-        assert_problem(&forked, NOW, "1 listRepos row(s) (sQ) whose prevSpaceRev is out of order");
-        assert_problem(&unseq, NOW, "1 writer row(s) (sW) without their listRepos row");
+        assert_problem(&forked, NOW, "1 listWriters row(s) (sQ) whose prevSpaceRev is out of order");
+        assert_problem(&unseq, NOW, "1 writer row(s) (sW) without their listWriters row");
         let mut behind = rows.clone();
         behind.host.as_mut().unwrap().writers[0].repo_rev = Tid(h.rev.0 - 1);
         assert_problem(&behind, NOW, "the space host has the account's own repo at rev");

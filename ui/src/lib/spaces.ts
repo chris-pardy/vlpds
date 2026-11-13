@@ -119,7 +119,7 @@ export async function listSpaces(s: OAuthSession): Promise<SpaceRef[]> {
   for (let cursor: string | undefined, i = 0; i < 50; i++) {
     const r = await s.call('com.atproto.space.listSpaces', { params: { limit: 100, cursor } })
     for (const x of r.spaces ?? []) {
-      const p = parseSpace(x.uri)
+      const p = parseSpace(x.space)
       if (p) out.push(p)
     }
     if (!r.cursor || !(r.spaces ?? []).length) break

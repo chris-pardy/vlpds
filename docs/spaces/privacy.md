@@ -58,7 +58,7 @@ With `--spaces` on, every `com.atproto.space.*` and policy method (`com.atproto.
 this node. One that isn't built yet answers 501 `MethodNotImplemented`. It never reaches the
 `atproto-proxy` fallback, where vlpds would mint service auth for it and send it to another host. With
 `--spaces` off they answer 501 too and are never proxied either, so an app can't get the node to
-sign a `notifyWrite` as one of its users and send it somewhere.
+sign a `notifyRepoUpdate` as one of its users and send it somewhere.
 
 ## Blobs
 
@@ -144,11 +144,11 @@ a block fails open ([Revocation](reading.md#revocation)).
 |---|---|
 | Account | Credential reads of its space repos get `RepoTakendown`. Its space writes are refused. Its outbox rows wait and resume if the takedown is reversed. Its OAuth sessions are revoked and stay revoked after a reversal, so apps have to sign in again. |
 | Record | Taken down by its space URI, through the same admin and moderation paths as a public record (`sec/td/space/{sid}/{collection}/{rkey}`). It's hidden from `getRecord`, `listRecords`, `listRepoOps` values and `getRepo`'s blocks. |
-| Space | Taken down at its authority, by its space URI (`updateSubjectStatus` with a `strongRef`, or the console). `getSpaceCredential` answers `NotAuthorized`, `listRepos` and `registerNotify` answer `SpaceNotFound`, credential reads of members' repos on the authority's host answer `SpaceNotFound` too (a credential minted before the takedown included), and members' notifies are acknowledged and dropped. Registered syncers get no more forwards, the authority's own writes included. The records stay on their authors' hosts. A vlpds extension. |
+| Space | Taken down at its authority, by its space URI (`updateSubjectStatus` with a `strongRef`, or the console). `authorizeSpaceSync` answers `NotAuthorized` (which withdraws a registration it carries), `listWriters` answers `SpaceNotFound`, credential reads of members' repos on the authority's host answer `SpaceNotFound` too (a credential minted before the takedown included), and members' notifies are acknowledged and dropped. Registered syncers get no more forwards, the authority's own writes included. The records stay on their authors' hosts. A vlpds extension. |
 
 No credential names a taken-down account either. A taken-down account mints no delegation tokens,
-and `getSpaceCredential` refuses a taken-down member (`AccountTakedown`) and a space whose authority
-is taken down (`RepoTakendown`) or deactivated (`RepoDeactivated`). `listRepos` answers the same for
+and `authorizeSpaceSync` refuses a taken-down member (`AccountTakedown`) and a space whose authority
+is taken down (`RepoTakendown`) or deactivated (`RepoDeactivated`). `listWriters` answers the same for
 such an authority, a credential it issued before its takedown included. Notifies and registrations
 still land, so its writer state stays current.
 
@@ -184,8 +184,8 @@ views agree.
 
 A syncer doesn't have to poll to find out. When a record is taken down or the takedown is reversed,
 the author's host sends its authority a notify at the same rev with the `data` it now serves, and the
-authority sequences it like any other. So `listRepos` shows the new `data` within a few milliseconds
-(~1 ms for a takedown in the tests), and every registered syncer gets a forward with the same rev
+authority sequences it like any other. So `listWriters` shows the new `data` within a few milliseconds
+(~1 ms for a takedown in the tests), and every registered syncer gets a `repoWrite` with the same rev
 and different `data`. That's the spec's signal to fall back to `getRepo`. The rev doesn't move,
 since nothing was written. The push isn't logged, so if the author's host crashes before it goes,
 syncers find out on their next poll instead. Every notify works out the served hash when it's sent,

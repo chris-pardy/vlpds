@@ -13,7 +13,7 @@ const METHODS: &[(&str, bool)] = &[
     ("com.atproto.space.getRecord?repo=did:plc:x", false),
     ("com.atproto.space.getDelegationToken?space=at://did:plc:x/space/com.example.group/default", false),
     ("com.atproto.space.createRecord", true),
-    ("com.atproto.space.notifyWrite", true),
+    ("com.atproto.space.notifyRepoUpdate", true),
     ("com.atproto.space.createSpace", true),
     ("com.atproto.space.getSpace", false),
     // NSID authorities are case-insensitive
@@ -23,8 +23,8 @@ const METHODS: &[(&str, bool)] = &[
 /// Spaces methods without a handler yet: with the flag they answer 501
 /// locally.
 const UNIMPLEMENTED: &[(&str, bool)] = &[
-    ("com.atproto.space.notifySpaceDeleted", true),
-    ("com.atproto.managedspace.checkUserAccess", false),
+    ("com.atproto.space.notifySpaceUpdate", true),
+    ("com.atproto.managedspace.checkAccess", false),
     // NSID authorities are case-insensitive
     ("COM.ATPROTO.Space.getRecord", false),
 ];
@@ -96,7 +96,7 @@ async fn spaces_methods_answer_501_locally_with_the_flag() {
 }
 
 /// Without the flag a Spaces NSID still answers 501 here and is never
-/// proxied: the proxy would mint service auth for it (a notifyWrite as the
+/// proxied: the proxy would mint service auth for it (a notifyRepoUpdate as the
 /// account) and send it wherever the header names.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn spaces_methods_without_the_flag_are_never_proxied() {

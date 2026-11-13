@@ -55,7 +55,7 @@ async fn writes_a_record_from_a_remote_pds() {
 
     // listSpaces on a member's PDS lists spaces written to, not joined.
     let listed = bob.get("com.atproto.space.listSpaces", &[]).await.ok();
-    let uris: Vec<&str> = listed["spaces"].as_array().unwrap().iter().filter_map(|s| s["uri"].as_str()).collect();
+    let uris: Vec<&str> = listed["spaces"].as_array().unwrap().iter().filter_map(|s| s["space"].as_str()).collect();
     assert!(uris.contains(&space.as_str()), "{listed}");
 }
 
@@ -360,32 +360,6 @@ async fn list_records_filters_to_one_collection() {
     assert_eq!(recs[0]["collection"], json!(TEST_COLLECTION_ALT));
 }
 
-/// listRecords: "reverses the listing order"
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn list_records_reverses_the_listing_order() {
-    let net = Net::new(0).await;
-    let (alice, dan) = (net.actor("alice", 0).await, net.actor("dan", 0).await);
-    let space = net.create_space(&alice, SpaceOpts::default()).await;
-    for k in ["aaa", "bbb", "ccc"] {
-        write(&dan, &space, W::new().rkey(k)).await.ok();
-    }
-    let list = |reverse: bool| {
-        let (dan, space) = (&dan, &space);
-        async move {
-            let mut q = vec![("space", space.as_str()), ("repo", dan.did.as_str()), ("collection", TEST_COLLECTION)];
-            if reverse {
-                q.push(("reverse", "true"));
-            }
-            let r = dan.get("com.atproto.space.listRecords", &q).await.ok();
-            r["records"].as_array().unwrap().iter().map(|x| x["rkey"].as_str().unwrap().to_string()).collect::<Vec<_>>()
-        }
-    };
-    let mut forward = list(false).await;
-    assert_eq!(forward.len(), 3);
-    forward.reverse();
-    assert_eq!(list(true).await, forward);
-}
-
 /// listRecords: "scopes a listing to one space"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn list_records_scopes_a_listing_to_one_space() {
@@ -520,9 +494,10 @@ async fn blobs_keeps_a_blob_shared_with_a_public_record() {
     space_get_blob(&net, &cred, &space, &alice.did, &cid).await.err(400, "BlobNotFound");
 }
 
-/// blobs: "filters listBlobs by revision"
+/// blobs: "lists the blobs of a repo to a syncer" (it replaced "filters
+/// listBlobs by revision"; `since` is gone, so it changes nothing)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn blobs_filters_list_blobs_by_revision() {
+async fn blobs_lists_the_blobs_of_a_repo_to_a_syncer() {
     let net = Net::new(2).await;
     let (alice, carol) = (net.actor("alice", 0).await, net.actor("carol", 2).await);
     let space = net.create_space(&alice, SpaceOpts { members: &[&carol], ..Default::default() }).await;
@@ -542,7 +517,7 @@ async fn blobs_filters_list_blobs_by_revision() {
     assert_eq!(got, want);
     let q = [("space", space.as_str()), ("repo", alice.did.as_str()), ("since", mid_rev.as_str())];
     let since = cred.get(&net.pds[0].url, "com.atproto.space.listBlobs", &q).await.ok();
-    assert_eq!(since["cids"], json!([blob_cid(&second)]));
+    assert_eq!(since["cids"], all["cids"]);
 }
 
 /// blobs: "scopes listBlobs to one space"

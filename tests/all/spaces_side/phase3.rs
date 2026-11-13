@@ -16,7 +16,7 @@
 //!
 //! `com.atproto.space.importRepo` as these tests pin it: `POST
 //! /xrpc/com.atproto.space.importRepo` with the getRepo archive
-//! (`application/octet-stream`) as the body, on the account's OAuth grant
+//! (`application/vnd.dasl.star`) as the body, on the account's OAuth grant
 //! with a `space:` scope allowing `create` in the archive's space and its
 //! collections. It answers 200 with no body.
 
@@ -30,7 +30,7 @@ use vlpds::space::lthash::LtHash;
 use vlpds::space::star;
 
 pub const IMPORT_REPO: &str = "com.atproto.space.importRepo";
-pub const STAR_TYPE: &str = "application/octet-stream";
+pub const STAR_TYPE: &str = "application/vnd.dasl.star";
 pub const UPDATE_SUBJECT_STATUS: &str = "com.atproto.admin.updateSubjectStatus";
 
 /// A DPoP-authenticated XRPC call on `sc`'s grant at `base`, with a raw
@@ -343,10 +343,8 @@ impl Syncer {
                 };
             }
             cursor = r["cursor"].as_str().map(String::from);
-            if r["commit"].is_object() {
-                commit = r["commit"].clone();
-                break;
-            }
+            // every page carries the current commit; the last has no cursor
+            commit = r["commit"].clone();
             if cursor.is_none() {
                 break;
             }

@@ -473,16 +473,15 @@ async fn named_account(router: &dyn Router, app: Option<&crate::xrpc::App>, path
 }
 
 /// Space host methods run at the space authority's owner, whatever DIDs
-/// their other fields name (notifyWrite's `repo` is the writer, putMember's
-/// `did` the member, getSpaceCredential's token the user).
+/// their other fields name (notifyRepoUpdate's `repo` is the writer,
+/// putMembers' DIDs the members, authorizeSpaceSync's token the user).
 fn space_host_method(nsid: &str) -> bool {
     matches!(
         nsid,
-        "com.atproto.space.getSpaceCredential"
+        "com.atproto.space.authorizeSpaceSync"
+            | "com.atproto.space.notifyRepoUpdate"
             | "com.atproto.space.notifyWrite"
-            | "com.atproto.space.listRepos"
-            | "com.atproto.space.registerNotify"
-            | "com.atproto.space.unregisterNotify"
+            | "com.atproto.space.listWriters"
             | "com.atproto.space.createSpace"
             | "com.atproto.space.getSpace"
             | "com.atproto.space.updateSpace"
@@ -533,7 +532,7 @@ async fn xrpc_target(
     if app.is_some_and(|a| a.config.spaces) && space_host_method(nsid) {
         return space_host_target(req).await;
     }
-    // the caller's own spaces: `did` is a filter (an authority), not whose
+    // the caller's own spaces: `spaceDid` is a filter (an authority), not whose
     if nsid == "com.atproto.space.listSpaces" && app.is_some_and(|a| a.config.spaces) {
         let sub = token_sub(&req);
         return Ok((req, sub));

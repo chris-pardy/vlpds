@@ -11,7 +11,7 @@ diagram:
   caption: "Three things to watch and the alert on each. A node without --spaces exports no vlpds_space_* series, and one with it exports what these alerts read at 0 from the start."
   nodes:
     - { id: cr, label: Credential reads, sub: "`…_credential_checks_total`", at: [0, 0], size: [13, 3], tone: blue }
-    - { id: ob, label: notifyWrite outbox, sub: "`…_outbox_oldest_seconds`", at: [16, 0], size: [13, 3], tone: accent }
+    - { id: ob, label: notifyRepoUpdate outbox, sub: "`…_outbox_oldest_seconds`", at: [16, 0], size: [13, 3], tone: accent }
     - { id: fo, label: Fan-out to syncers, sub: "`…_notify_total{hop=fanout}`", at: [32, 0], size: [13, 3], tone: violet }
     - { id: a3, label: VlpdsSpaceCredentialRejectsHigh, sub: "> 25% refused · 15 min", at: [0, 6], size: [13, 3], tone: danger }
     - { id: a1, label: VlpdsSpaceOutboxBacklog, sub: "oldest row > 1 h · 10 min", at: [16, 6], size: [13, 3], tone: danger }
@@ -33,7 +33,7 @@ it. With no space traffic, a node with it on makes one conditional GET of the re
 
 ## What you get with `--spaces`
 
-A node with the flag serves every Spaces method a PDS serves at the `98ef3a6b` pin, in both roles.
+A node with the flag serves every Spaces method a PDS serves at the `d4def6e9` pin (the Nov 12 alpha), in both roles.
 As a repo host it holds your accounts' space repos. As a space host it runs the spaces your
 accounts govern, under the baseline policies (`personalspace`, `memberspace`, `managedspace`).
 Nothing is proxied to another host.
@@ -42,14 +42,16 @@ Nothing is proxied to another host.
 |---|---|
 | Space records | `space.createRecord`, `putRecord`, `deleteRecord`, `applyWrites`, `clearRecords`, `getRecord`, `listRecords`, `listSpaces` |
 | Sync | `space.getLatestCommit`, `listRepoOps`, `getRepo`, `listBlobs`, `getBlob` |
-| Credentials | `space.getDelegationToken`, `getSpaceCredential`, `notifyCredentialRevoked` |
-| Space host | `space.createSpace`, `getSpace`, `updateSpace`, `deleteSpace`, `removeWriter`, `memberspace.putMember`, `removeMember`, `listMembers`, and `space.notifyWrite`, `listRepos`, `registerNotify`, `unregisterNotify` |
+| Credentials | `space.getDelegationToken`, `authorizeSpaceSync` (with notify registrations), `notifyCredentialsRevoked` |
+| Space host | `space.createSpace`, `getSpace`, `updateSpace`, `deleteSpace`, `removeWriter`, `memberspace.putMembers`, `removeMembers`, `listMembers`, and `space.notifyRepoUpdate`, `listWriters` |
 | Migration | `space.importRepo`, `exportSpaceMeta`, `importSpaceMeta` |
 | vlpds only | operator reads (`vlpds.admin.getSpaceRepo`, `listSpaceRecords`, `getSpaceRecord`), `vlpds.admin.checkSpace`, space takedowns |
 
 A method under `com.atproto.space.*` or a policy's namespace (`com.atproto.memberspace.*`,
-`managedspace.*`, `personalspace.*`) that a PDS doesn't serve (`notifySpaceDeleted` and
-`managedspace.checkUserAccess` go to syncers and managing apps) answers 501 here.
+`managedspace.*`, `personalspace.*`) that a PDS doesn't serve (`confirmRegistration` and
+`notifySpaceUpdate` go to syncers, `managedspace.checkAccess` to managing apps) answers 501 here.
+`notifyWrite` and `notifyCredentialRevoked` are still taken under their Nov 5 names, for peers not
+yet past them.
 
 Spaces created before space policies convert to them when their row is next read, as the
 reference's migration converts them: a managing app on either side makes a `managedspace` (asked
@@ -116,7 +118,7 @@ approves the writes on the consent screen.
 | Watch | Where | Healthy |
 |---|---|---|
 | Outbox depth and age | `vlpds_space_outbox_rows`, `vlpds_space_outbox_oldest_seconds` | a few rows, oldest under a few minutes |
-| Notify failures | `notifyWrite failure ratio by hop` | ~0 for `out` and `in`. `fanout` fails while a syncer is down |
+| Notify failures | `Space notify failure ratio by hop` | ~0 for `out` and `in`. `fanout` and `notice` fail while a syncer is down |
 | Unconfirmed same-rev notifies | `vlpds_space_notify_total{hop="in",result=~"same_rev_unverified\|same_rev_capped"}` | 0. These only come with record takedowns |
 | Credential cache hit rate | `Credential cache hit ratio` | high under steady polling |
 | Digest mismatches | `vlpds_space_digest_mismatch_total` | 0, always |
@@ -179,10 +181,11 @@ methods behind it answer 501.
   members, writers, records or newest. Records only count space repos stored here, since a writer on
   another PDS keeps its own.
 - A space's page shows its policies, members, writers (repoRev, spaceRev and the first 8 bytes of
-  the data hash), the newest spaceRev of each writer, its notify registrations (the endpoint's host
-  only), its records taken down here and its audit entries. You can take the space down or restore
-  it, and remove a registration with a reason. A removed service can register again with a
-  credential, so take the space down to keep it out.
+  the data hash), the newest spaceRev of each writer, its notify registrations (by id, with the endpoint's host
+  only, the expiry and whether its expiry notice went out), its records taken down here and its
+  audit entries. You can take the space down or restore it, and remove a registration by id with a
+  reason. A removed syncer can register again the next time it authorizes, so take the space down
+  to keep it out.
 - An account's page lists the spaces it writes in and the ones it governs.
 - The audit log has a Spaces filter.
 
@@ -218,10 +221,11 @@ and no per-repo state, however many records the repo has.
 | `Signature-Input` and `Signature` headers | 8 KiB each |
 | Revocations | 1–100 `jti`s per call (up to 128 characters each), each held 3,610 s · only ones with a stake here are stored · 2,000 live per authority, 1,000 per space, 5,000 per account here, 50,000 in all · one past a cap blocks its space, past 100 of an authority's the authority, past 1,000 authorities every remote one (`VlpdsSpaceRevocationsSaturated`, never local authorities), each for 3,610 s · 8 waiting per node · credential reads 503 after 6 min without a good read |
 | `applyWrites` | 200 ops |
-| `notifyWrite` with a future `repoRev` | refused past 5 min |
+| `notifyRepoUpdate` with a future `repoRev` | refused past 5 min |
 | Outbox | 262,144 rows in memory, 256 sends in flight, 8 per authority and 32 in all to authorities whose last send failed, retries for 24 h |
-| Fan-out | 4,096 queued for each of 8 dispatchers, 256 per lane, 4,096 and 16 sends in flight per service host, 65,536 queued and 16,384 lanes in all (past those, drops marked as gaps: syncers catch up with `listRepos`), 512 sends in flight in all |
-| Notify registrations | 24 h · 256 per space, 1,024 across one authority's spaces · 60 an hour per credential (`space-register`) · service ids up to 512 bytes |
+| Fan-out | 4,096 queued for each of 8 dispatchers, 256 per (space, registration) lane, 4,096 and 16 sends in flight per endpoint host, 65,536 queued and 16,384 lanes in all (past those, drops marked as gaps: syncers catch up with `listWriters`), 512 sends in flight in all |
+| Notify registrations | active until the credential's `exp` · 256 per space, lapsed ones included · 1,024 active across one authority's spaces · 60 new an hour per space and endpoint host (`space-register`) · endpoints up to 2,048 bytes, tokens up to 512 |
+| Syncer notices | `spaceDeleted` and `registrationExpired`: sent 50 at a time, retried after 1 min, 10 min, 1 h, 6 h, then every 12 h, for 72 h |
 | Spaces | 1,000 live per account · 100 created a day per account (`space-create`) |
 | `listRecords` and `listRepoOps` pages | end early with a cursor past 4 MiB of values |
 | Memory | space heads cache 64 MiB, credential cache 50,000 entries |
@@ -233,14 +237,14 @@ and no per-repo state, however many records the repo has.
 | `vlpds_space_writes_total{op,result}` | space writes by method and result |
 | `vlpds_space_reads_total{method,auth}` | reads by method and auth (`credential` or `oauth`) |
 | `vlpds_space_list_repo_ops_total{path}`, `vlpds_space_list_repo_ops_seconds{path}` | `noop` (answered from memory) vs `scan`, and server time for each |
-| `vlpds_space_notify_total{hop,result}` | notify hops: `out` (this node's writes), `in` (as an authority), `fanout` (to syncers). `in` counts `same_rev_unverified` and `same_rev_capped` for a same-rev notify from another host that its PDS didn't confirm or that came over the cap ([Privacy](privacy.md#takedowns)) |
+| `vlpds_space_notify_total{hop,result}` | notify hops: `out` (`notifyRepoUpdate` for this node's writes), `in` (`notifyRepoUpdate` as an authority), `fanout` (`notifySpaceUpdate` updates to syncers), `notice` (deletion and expiry notices, first sends). `in` counts `same_rev_unverified` and `same_rev_capped` for a same-rev notify from another host that its PDS didn't confirm or that came over the cap ([Privacy](privacy.md#takedowns)) |
 | `vlpds_space_notify_ack_seconds` | a write's ack to the authority's 200 |
 | `vlpds_space_outbox_rows`, `vlpds_space_outbox_oldest_seconds` | outbox depth and the age of its oldest row (rows held for an inactive writer don't count toward the age) |
 | `vlpds_space_outbox_overflow_total` | rows left in the bucket because the outbox was full |
-| `vlpds_space_fanout_queue_depth`, `vlpds_space_fanout_dropped_total{reason}`, `vlpds_space_fanout_coalesced_total` | fan-out backlog, drops and replaced forwards |
+| `vlpds_space_fanout_queue_depth`, `vlpds_space_fanout_dropped_total{reason}`, `vlpds_space_fanout_coalesced_total` | fan-out backlog, drops by reason (`queue_full`, `lane_full`, `host_full`, `all_full`, `lanes_full`, `gave_up`, `expired`, `takendown`) and replaced forwards |
 | `vlpds_space_credential_cache_total{result}` | credential cache hits and misses |
 | `vlpds_space_credential_checks_total{result}` | `ok`, or why a read was refused: `bad_sig`, `expired`, `revoked`, `audience`, `space` |
-| `vlpds_space_credentials_issued_total{result}`, `vlpds_space_delegations_total` | credentials issued as an authority, delegation tokens minted |
+| `vlpds_space_credentials_issued_total{result}`, `vlpds_space_delegations_total` | `authorizeSpaceSync` answers as an authority, delegation tokens minted |
 | `vlpds_space_revocations` | revoked credentials in force |
 | `vlpds_space_export_bytes`, `vlpds_space_oplog_pruned_total` | the chunk each `getRepo` fills, oplog ops pruned |
 | `vlpds_space_digest_mismatch_total` | space repos whose head disagreed with the data hash recomputed from their records. Should stay 0 |
@@ -258,7 +262,7 @@ the fan-out queue and drops, and revocations held.
 
 | Alert | Fires when | First thing to check |
 |---|---|---|
-| `VlpdsSpaceOutboxBacklog` | a node's oldest outbox row is over 1 h old for 10 min | `notifyWrite by hop and result`: `out retry` means the authority is failing. Inactive writers' rows wait without aging the outbox |
+| `VlpdsSpaceOutboxBacklog` | a node's oldest outbox row is over 1 h old for 10 min | `Space notifies by hop and result`: `out retry` means the authority is failing. Inactive writers' rows wait without aging the outbox |
 | `VlpdsSpaceNotifyFanoutFailing` | over 50% of fan-out sends fail, at over 0.1/s, for 30 min | one syncer down (nothing to do) or this node's egress |
 | `VlpdsSpaceCredentialRejectsHigh` | over 25% of credential reads are refused, at over 0.5/s, for 15 min (expired ones left out) | which `result` dominates. One client stuck on `bad_sig` is that app's bug |
 | `VlpdsSpaceRevocationsSaturated` (page) | the revocation blocks are saturated: every remote authority's credentials are refused | `vlpds_space_revocation_blocks{kind}` and the `space revocation not stored` warnings. It clears 3,610 s after the last block ([runbook](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsspacerevocationssaturated)) |

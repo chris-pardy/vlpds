@@ -433,7 +433,7 @@ function Governed({ sess, s, gov, reload }: { sess: OAuthSession; s: SpaceRef; g
   const ask = useAction(() => connect(sess.did, `${READ_SCOPE} ${OWNER_SCOPE}`, here))
   const [removing, setRemoving] = useState<string>()
   const remove = useAction(async (did: string) => {
-    await sess.call('com.atproto.memberspace.removeMember', { body: JSON.stringify({ space: s.uri, did }), type: 'application/json' })
+    await sess.call('com.atproto.memberspace.removeMembers', { body: JSON.stringify({ space: s.uri, dids: [did] }), type: 'application/json' })
     setRemoving(undefined)
     reload()
   })
@@ -546,8 +546,8 @@ function AddMember({ sess, s, reload }: { sess: OAuthSession; s: SpaceRef; reloa
   const look = useAction(async () => setPending(await resolveMember(handle)))
   const add = useAction(async () => {
     if (!pending) return
-    await sess.call('com.atproto.memberspace.putMember', {
-      body: JSON.stringify({ space: s.uri, did: pending.did, read: true, write: access === 'write' }),
+    await sess.call('com.atproto.memberspace.putMembers', {
+      body: JSON.stringify({ space: s.uri, members: [{ did: pending.did, read: true, write: access === 'write' }] }),
       type: 'application/json',
     })
     setDone(pending.handle ? `@${pending.handle}` : pending.did)

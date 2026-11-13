@@ -423,7 +423,7 @@ pub(super) async fn two_hosts() -> TwoHosts {
             json!({"spaceType": TEST_SPACE_TYPE, "skey": skey, "policy": memberspace(json!({}))}),
         )
         .await;
-    assert_eq!(r.ok()["uri"], json!(space));
+    assert_eq!(r.ok()["space"], json!(space));
     for m in [&bob, &carol] {
         put_member(&alice, &space, m, true, true).await.ok();
     }
@@ -519,18 +519,18 @@ async fn vlpds_export_imports_on_another_vlpds() {
     let (rev, _) = head(moved, &h.space).await.unwrap();
     let mut seen = J::Null;
     for _ in 0..100 {
-        seen = cred.get(&h.c.url, "com.atproto.space.listRepos", &[("space", &h.space)]).await.ok();
-        let bob = seen["repos"].as_array().unwrap().iter().find(|x| x["did"] == json!(h.bob.did));
+        seen = cred.get(&h.c.url, "com.atproto.space.listWriters", &[("space", &h.space)]).await.ok();
+        let bob = seen["repos"].as_array().unwrap().iter().find(|x| x["repo"] == json!(h.bob.did));
         if bob.is_some_and(|b| b["repoRev"] == json!(rev)) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let bob = seen["repos"].as_array().unwrap().iter().find(|x| x["did"] == json!(h.bob.did));
+    let bob = seen["repos"].as_array().unwrap().iter().find(|x| x["repo"] == json!(h.bob.did));
     assert_eq!(
         bob.map(|b| &b["repoRev"]),
         Some(&json!(rev)),
-        "the authority's listRepos after bob wrote on the new host: {seen}"
+        "the authority's listWriters after bob wrote on the new host: {seen}"
     );
     let mut s = Syncer::new(&h.b.url, &h.space, &h.bob.did, cred);
     s.full().await;
@@ -879,8 +879,8 @@ async fn a_refused_import_leaves_the_repo() {
     refused_mentioning(&r, &["do not match the commit"]);
     let built = b.build();
     let star = built.star();
-    import_repo(&o.bob, &star[..star.len() - 1]).await.err(400, "InvalidRequest");
-    import_repo(&o.alice, &star).await.err(400, "InvalidRequest");
+    import_repo(&o.bob, &star[..star.len() - 1]).await.err(400, "InvalidRepoFile");
+    import_repo(&o.alice, &star).await.err(400, "RepoMismatch");
     assert_eq!(head(&o.bob, &o.space).await, before, "the repo is as it was");
     assert_eq!(all_records(&o.bob, &o.space).await.len(), 1);
     import_repo(&o.bob, &star).await.ok();

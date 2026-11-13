@@ -1157,7 +1157,7 @@ fn write_space_check(out: &mut dyn Write, r: &J) -> Result<()> {
         let h = &r["host"];
         writeln!(
             out,
-            "Space host   : {} writer(s), {} listRepos row(s), max spaceRev {}{}",
+            "Space host   : {} writer(s), {} listWriters row(s), max spaceRev {}{}",
             s(&h["writers"]),
             s(&h["seq"]),
             s(&h["maxSpaceRev"]),

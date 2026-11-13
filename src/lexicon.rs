@@ -289,9 +289,10 @@ fn record_lexicon(nsid: &str, doc: J) -> Result<Lexicons, String> {
 /// the consent unit of `space:` OAuth scopes (@atproto/lexicon `lexSpace`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpaceDecl {
-    pub name: String,
-    /// (language tag, name)
-    pub name_lang: Vec<(String, String)>,
+    /// What the consent screen calls the type; without one, its NSID.
+    pub title: Option<String>,
+    /// (language tag, title)
+    pub title_lang: Vec<(String, String)>,
     pub description: Option<String>,
     pub key: Option<String>,
     pub collections: Vec<String>,
@@ -319,16 +320,18 @@ pub fn space_declaration(nsid: &str, doc: &J) -> Result<SpaceDecl, String> {
         Some(J::String(v)) => Ok(Some(v.clone())),
         Some(_) => Err(bad(k)),
     };
-    // proposals #118 renames `name` to `title`; either is taken
-    let field = if main.get("name").is_none() && main.get("title").is_some() { "title" } else { "name" };
-    // zod's string length: UTF-16 code units
-    let name = main[field]
-        .as_str()
-        .filter(|n| (1..=64).contains(&n.encode_utf16().count()))
-        .ok_or_else(|| bad(field))?
-        .to_string();
+    // an optional `title` since the Nov 12 alpha (proposals #118); the
+    // Nov 5 alpha's required `name` is still read as one
+    let field = if main.get("title").is_none() && main.get("name").is_some() { "name" } else { "title" };
+    // the schema's string length: UTF-16 code units
+    let title = match main.get(field) {
+        None => None,
+        Some(t) => Some(
+            t.as_str().filter(|n| (1..=64).contains(&n.encode_utf16().count())).ok_or_else(|| bad(field))?.to_string(),
+        ),
+    };
     let lang_field = format!("{field}:lang");
-    let name_lang = match main.get(&lang_field) {
+    let title_lang = match main.get(&lang_field) {
         None => Vec::new(),
         Some(J::Object(m)) => m
             .iter()
@@ -355,7 +358,7 @@ pub fn space_declaration(nsid: &str, doc: &J) -> Result<SpaceDecl, String> {
     if key.as_deref().is_some_and(|k| !key_ok(k)) {
         return Err(bad("key"));
     }
-    Ok(SpaceDecl { name, name_lang, description: opt_str("description")?, key, collections })
+    Ok(SpaceDecl { title, title_lang, description: opt_str("description")?, key, collections })
 }
 
 /// Lexicon documents compiled into an arena of defs with refs resolved to
@@ -1619,8 +1622,8 @@ mod tests {
         assert_eq!(
             space_declaration("com.example.group", &decl),
             Ok(SpaceDecl {
-                name: "Group".into(),
-                name_lang: vec![("pt-BR".into(), "Grupo".into())],
+                title: Some("Group".into()),
+                title_lang: vec![("pt-BR".into(), "Grupo".into())],
                 description: Some("a group".into()),
                 key: Some("any".into()),
                 collections: vec!["com.example.post".into(), "com.example.like".into()],
@@ -1660,8 +1663,14 @@ mod tests {
             m.insert("title".into(), name);
             m.insert("title:lang".into(), serde_json::json!({"pt-BR": "Grupo"}));
         });
-        assert_eq!(titled.as_ref().map(|d| (d.name.as_str(), d.name_lang.len())), Ok(("Group", 1)));
-        assert!(with(&|d| d["defs"]["main"].as_object_mut().unwrap().remove("name").map(drop).unwrap()).is_err());
+        assert_eq!(titled.as_ref().map(|d| (d.title.as_deref(), d.title_lang.len())), Ok((Some("Group"), 1)));
+        // no title at all: the consent screen shows the NSID
+        let untitled = with(&|d| {
+            let m = d["defs"]["main"].as_object_mut().unwrap();
+            m.remove("name");
+            m.remove("name:lang");
+        });
+        assert_eq!(untitled.map(|d| d.title), Ok(None));
         assert!(with(&|d| d["id"] = "com.example.other".into()).is_err());
         assert_eq!(
             with(&|d| d["defs"]["other"] = serde_json::json!({"type": "space", "name": "x", "collections": []})),

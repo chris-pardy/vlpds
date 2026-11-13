@@ -2,6 +2,7 @@
 // auth layer, and the errors scenarios classify on.
 import { AtpBaseClient } from '@atproto/api'
 import { PORTS } from './env.mjs'
+import { attachSpaceMethods } from './xrpc.mjs'
 
 /** A method the server answered 501 for (or doesn't route): a scenario using it is "not implemented". */
 export class NotImplemented extends Error {
@@ -102,7 +103,8 @@ function nsidOf(path) {
 }
 
 /**
- * The reference XRPC client (@atproto/api at the alpha) against `base`, with
+ * The reference XRPC client (@atproto/api at the alpha, plus the space
+ * methods from lib/xrpc.mjs) against `base`, with
  * `sign(request)` adding auth headers to each request (and retrying it when it
  * returns a new Request, for DPoP nonces). 501 becomes {@link NotImplemented}.
  */
@@ -132,7 +134,7 @@ export function makeClient(base, sign = null) {
     if (res.status === 404 && notImplementedStatus(404, await res.clone().text()) === 501) throw new NotImplemented(nsid, '(404)')
     return res
   }
-  return new AtpBaseClient(handler)
+  return attachSpaceMethods(new AtpBaseClient(handler), handler)
 }
 
 /** Call and return `{ok, status, error, message, data}` instead of throwing XRPC errors. */

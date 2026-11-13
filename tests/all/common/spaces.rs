@@ -4,7 +4,7 @@
 //!
 //! - `SpaceClient::new(&server, name, scope)`: account, PAR, consent, token.
 //! - `get`/`post`: DPoP-authenticated XRPC as that account.
-//! - `credential(space)`: getDelegationToken, then getSpaceCredential at the
+//! - `credential(space)`: getDelegationToken, then authorizeSpaceSync at the
 //!   authority's host, bound to the holder key.
 //! - `signed_get(base, nsid, query, credential, audience)`: a read with
 //!   `Authorization: Atproto-Space-Credential`, signed over the authorization and
@@ -94,6 +94,23 @@ pub async fn resp(r: reqwest::Response) -> Resp {
 fn oauth_resp(r: oauth::Resp) -> Resp {
     let body = bytes::Bytes::from(serde_json::to_vec(&r.body).unwrap());
     Resp { status: r.status, headers: r.headers, body, json: r.body }
+}
+
+/// putMembers' body for one member, from the Nov 5 alpha's putMember shape
+/// (`{space, did, read, write}`); a missing flag stays missing.
+pub fn put_members(one: J) -> J {
+    let mut m = serde_json::Map::new();
+    for k in ["did", "read", "write"] {
+        if let Some(v) = one.get(k) {
+            m.insert(k.into(), v.clone());
+        }
+    }
+    json!({"space": one["space"], "members": [m]})
+}
+
+/// removeMembers' body for one DID, from removeMember's `{space, did}`.
+pub fn remove_members(one: J) -> J {
+    json!({"space": one["space"], "dids": [one["did"]]})
 }
 
 /// A space URI.
@@ -230,7 +247,7 @@ impl SpaceClient {
                 }),
             )
             .await;
-        r.ok()["uri"].as_str().unwrap().to_string()
+        r.ok()["space"].as_str().unwrap().to_string()
     }
 
     pub async fn create_record(&self, space: &str, collection: &str, rkey: Option<&str>, record: J) -> Resp {
@@ -259,7 +276,7 @@ impl SpaceClient {
         self.get("com.atproto.space.getDelegationToken", &[("space", space)]).await
     }
 
-    /// getSpaceCredential at `host` (the authority's PDS) for `token`,
+    /// authorizeSpaceSync at `host` (the authority's PDS) for `token`,
     /// signed by this client's holder key.
     pub async fn exchange(&self, host: &str, space: &str, token: &str) -> Resp {
         self.exchange_as(&self.holder, host, space, token).await
@@ -269,7 +286,7 @@ impl SpaceClient {
         self.exchange_with(holder, host, space, token, None).await
     }
 
-    /// getSpaceCredential with a client attestation (an `allowedApps`
+    /// authorizeSpaceSync with a client attestation (an `allowedApps`
     /// list's proof of which app asks).
     pub async fn exchange_with(
         &self,
@@ -279,12 +296,33 @@ impl SpaceClient {
         token: &str,
         attestation: Option<&str>,
     ) -> Resp {
-        let rb = self.srv.http.post(format!("{host}/xrpc/com.atproto.space.getSpaceCredential"));
-        let mut body = json!({"space": space, "credentialKid": holder.did, "delegationToken": token});
+        let rb = self.srv.http.post(format!("{host}/xrpc/com.atproto.space.authorizeSpaceSync"));
+        let mut body = json!({"space": space, "credentialKey": holder.did, "delegationToken": token});
         if let Some(a) = attestation {
             body["clientAttestation"] = json!(a);
         }
         resp(rb.json(&body).send().await.unwrap()).await
+    }
+
+    /// Registers `endpoint` with `token` for `space`'s notifications:
+    /// authorizeSpaceSync at `host` with a fresh delegation token and
+    /// `notify`; the response as is.
+    pub async fn register_at(&self, host: &str, space: &str, endpoint: &str, token: &str) -> Resp {
+        let dt = self.delegation_token(space).await.ok()["token"].as_str().unwrap().to_string();
+        let rb = self.srv.http.post(format!("{host}/xrpc/com.atproto.space.authorizeSpaceSync"));
+        let body = json!({
+            "space": space,
+            "credentialKey": self.holder.did,
+            "delegationToken": dt,
+            "notify": notify(endpoint, token),
+        });
+        resp(rb.json(&body).send().await.unwrap()).await
+    }
+
+    /// [`Self::register_at`] on this client's own PDS.
+    pub async fn register(&self, space: &str, endpoint: &str, token: &str) -> Resp {
+        let host = self.srv.base.clone();
+        self.register_at(&host, space, endpoint, token).await
     }
 
     /// A fresh delegation token for `space` exchanged at `host`, with an
@@ -326,8 +364,20 @@ impl SpaceClient {
     }
 }
 
-/// A credential call with a JSON body (registerNotify, unregisterNotify),
-/// signed by `holder`.
+/// authorizeSpaceSync's `notify`.
+pub fn notify(endpoint: &str, token: &str) -> J {
+    json!({"endpoint": endpoint, "token": token})
+}
+
+pub const CONFIRM_REGISTRATION: &str = "/xrpc/com.atproto.space.confirmRegistration";
+pub const NOTIFY_SPACE_UPDATE: &str = "/xrpc/com.atproto.space.notifySpaceUpdate";
+
+/// A syncer's answer to confirmRegistration: its challenge, echoed.
+pub fn confirmed(body: &J) -> J {
+    json!({"challenge": body["challenge"]})
+}
+
+/// A credential call with a JSON body, signed by `holder`.
 pub async fn signed_post_as(
     http: &reqwest::Client,
     holder: &Holder,
@@ -358,7 +408,7 @@ pub async fn signed_get_as(
     audience: &str,
 ) -> Resp {
     let repo = query.iter().find(|(n, _)| *n == "repo").map(|(_, v)| *v);
-    let kem = match (mac_type(nsid), repo) {
+    let kem = match (mac_profile(nsid), repo) {
         (Some(_), Some(repo)) => kem_key_at(http, base, repo).await,
         _ => None,
     };
@@ -384,23 +434,23 @@ pub async fn signed_get_kem(
     }
     let find = |k: &str| query.iter().find(|(n, _)| *n == k).map(|(_, v)| *v);
     let mut want = None;
-    if let (Some(ty), Some(kem)) = (mac_type(nsid), kem) {
+    if let (Some(p), Some(kem)) = (mac_profile(nsid), kem) {
         let (share, secret) = mac::encapsulate(kem).unwrap();
-        rb = rb.header(mac::WANT_MAC_HEADER, mac::format_want_mac(ty, &share));
-        want = Some((ty, secret));
+        rb = rb.header(mac::ACCEPT_SIGNATURE, mac::format_request(p, &share));
+        want = Some((p, share, secret));
     }
     let r = resp(rb.send().await.unwrap()).await;
-    if let (Some((ty, secret)), 200) = (want, r.status) {
-        verify_mac(&r, nsid, ty, &secret, find("space").unwrap_or(""), find("repo").unwrap_or(""));
+    if let (Some((p, share, secret)), 200) = (want, r.status) {
+        verify_mac(&r, nsid, p, &share, &secret, find("space").unwrap_or(""), find("repo").unwrap_or(""));
     }
     r
 }
 
-pub fn mac_type(nsid: &str) -> Option<mac::MacType> {
+pub fn mac_profile(nsid: &str) -> Option<mac::Profile> {
     match nsid {
-        "com.atproto.space.getRecord" => Some(mac::MacType::Record),
+        "com.atproto.space.getRecord" => Some(mac::Profile::Record),
         "com.atproto.space.getLatestCommit" | "com.atproto.space.listRepoOps" | "com.atproto.space.getRepo" => {
-            Some(mac::MacType::Repo)
+            Some(mac::Profile::Commit)
         }
         _ => None,
     }
@@ -426,26 +476,27 @@ pub fn response_commit(r: &Resp, nsid: &str) -> Option<commit::Commit> {
     }
 }
 
-/// Asserts a response's MAC verifies under `secret` (and that one came
-/// with a commit or record, and none without).
-pub fn verify_mac(r: &Resp, nsid: &str, ty: mac::MacType, secret: &[u8; 32], space: &str, repo: &str) {
-    let header = r.headers.get(mac::MAC_HEADER).map(|v| v.to_str().unwrap().to_string());
-    let vary = r.headers.get_all("vary").iter().any(|v| v.to_str().unwrap().contains(mac::WANT_MAC_HEADER));
-    assert!(vary, "{nsid}: Vary names the MAC request header");
-    match ty {
-        mac::MacType::Record => {
-            let m = mac::parse_mac(header.as_deref(), ty).expect("a record MAC");
+/// Asserts a response's MAC, requested with `share`, verifies under
+/// `secret`, and that every MAC-bearing response carries one.
+pub fn verify_mac(r: &Resp, nsid: &str, p: mac::Profile, share: &str, secret: &[u8; 32], space: &str, repo: &str) {
+    let vary = r.headers.get_all("vary").iter().any(|v| v.to_str().unwrap().contains("Accept-Signature"));
+    assert!(vary, "{nsid}: Vary names Accept-Signature");
+    let expose: Vec<&str> =
+        r.headers.get_all("access-control-expose-headers").iter().map(|v| v.to_str().unwrap()).collect();
+    for name in [p.name(), "signature-input", "signature"] {
+        assert!(expose.contains(&name), "{nsid}: browsers may read {name}: {expose:?}");
+    }
+    match p {
+        mac::Profile::Record => {
             let (uri, cid) = (r.json["uri"].as_str().unwrap(), r.json["cid"].as_str().unwrap());
-            let cid = vlatproto::cid::Cid::parse(cid).unwrap().to_bytes();
-            assert!(commit::verify_record(secret, uri, &cid, &m), "{nsid}: the record MAC verifies");
+            mac::verify_record(uri, cid, share, secret, &r.headers)
+                .unwrap_or_else(|e| panic!("{nsid}: the record MAC verifies: {e}"));
         }
-        mac::MacType::Repo => match response_commit(r, nsid) {
-            Some(c) => {
-                let m = mac::parse_mac(header.as_deref(), ty).expect("a commit MAC");
-                assert!(commit::verify(&c, space, repo, secret, &m), "{nsid}: the commit MAC verifies");
-            }
-            None => assert!(header.is_none(), "{nsid}: a page without a commit has no MAC"),
-        },
+        mac::Profile::Commit => {
+            let c = response_commit(r, nsid).unwrap_or_else(|| panic!("{nsid}: a commit on every page"));
+            commit::verify(&c, space, repo, share, secret, &r.headers)
+                .unwrap_or_else(|e| panic!("{nsid}: the commit MAC verifies: {e}"));
+        }
     }
 }
 
@@ -470,7 +521,10 @@ pub fn verify_star(body: &[u8], space: &str, repo: &str) -> Star {
     let mut records = Vec::with_capacity(pairs.len());
     for (i, (key, value)) in pairs.into_iter().enumerate() {
         if i > 0 {
-            assert!(records.last().is_some_and(|(p, _, _): &(String, _, _)| p.as_bytes() < &key[..]), "strict path order");
+            assert!(
+                records.last().is_some_and(|(p, _, _): &(String, _, _)| p.as_bytes() < &key[..]),
+                "strict path order"
+            );
         }
         let path = String::from_utf8(key).expect("a UTF-8 path");
         let (c, r) = path.split_once('/').expect("collection/rkey");

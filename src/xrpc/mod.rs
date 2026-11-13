@@ -148,7 +148,7 @@ pub struct App {
     pub ui: Arc<WebUi>,
     /// Objects and bytes in the bucket by component (vlsync_store::store_stats).
     pub store_stats: Arc<vlsync_store::store_stats::StoreStats>,
-    /// `--spaces` (src/space): space repo heads, the notifyWrite outbox,
+    /// `--spaces` (src/space): space repo heads, the notifyRepoUpdate outbox,
     /// revocations. None without the flag.
     pub spaces: Option<Arc<crate::space::Spaces>>,
     pub space_blob_accounts: blobs::SpaceBlobAccounts,

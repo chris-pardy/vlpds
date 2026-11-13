@@ -1079,7 +1079,7 @@ async fn proxy_request_admitted(app: &App, req: Request, slot: &mut Option<InFli
         return Err(XrpcError::bad("InvalidRequest", "invalid xrpc path"));
     }
     // never proxied, with --spaces on or off: an atproto-proxy header would
-    // otherwise get service auth minted for these methods (a notifyWrite as
+    // otherwise get service auth minted for these methods (a notifyRepoUpdate as
     // the account) sent wherever it names
     if crate::space::is_space_nsid(&lxm) {
         return Err(xerr(StatusCode::NOT_IMPLEMENTED, "MethodNotImplemented", "Method Not Implemented"));

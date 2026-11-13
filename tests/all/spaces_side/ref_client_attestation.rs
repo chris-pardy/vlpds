@@ -2,7 +2,7 @@
 //! (5b95b2f2), a unit test of `ClientAttestationVerifier` against an
 //! injected fetch, plus the "client attestation" cases of
 //! `space/policy.test.ts`. vlpds verifies an attestation inside
-//! getSpaceCredential, so each case is a credential mint for a space whose
+//! authorizeSpaceSync, so each case is a credential mint for a space whose
 //! `allowedApps` lists a [`MockClientApp`] served over loopback HTTP.
 //!
 //! Every refusal is a 4xx: the reference pins "Invalid client attestation"

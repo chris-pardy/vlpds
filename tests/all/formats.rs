@@ -337,10 +337,26 @@ fn space_writer() -> vlpds::space::rows::WriterRow {
         repo_rev: vlatproto::tid::Tid(0x1234_5678_9abc),
         hash: [7; 32],
         space_rev: vlatproto::tid::Tid(0x1234_5678_9abd),
+        removed: false,
     }
 }
 
-/// A notify registration (`sN`): its key and row.
+/// A notify registration (`sG`): its key and row.
+fn space_registration() -> Vec<u8> {
+    let sid = vlpds::state::space_id(SPACE);
+    let row = vlpds::space::rows::RegistrationRow {
+        endpoint: "https://syncer.example".into(),
+        token: "syncer-token".into(),
+        expires: 1_790_000_000_000_000,
+        expiry_notified: true,
+    };
+    let key = vlpds::state::space_registration_key(DID, &sid, &row.id());
+    let k: BTreeMap<&str, String> =
+        [("space registration sG/", hex::encode(key)), ("row", hex::encode(row.encode()))].into_iter().collect();
+    pretty(&k)
+}
+
+/// A Nov 5 notify registration (`sN`, no longer written): its key and row.
 fn space_notify() -> Vec<u8> {
     let sid = vlpds::state::space_id(SPACE);
     let key = vlpds::state::space_notify_key(DID, &sid, "did:web:syncer.example#atproto_space_syncer");
@@ -596,6 +612,11 @@ fn written() -> Vec<(&'static str, Vec<u8>)> {
         ("state/space_oplog.bin", space_ops()),
         ("state/space_outbox.bin", space_outbox().encode().to_vec()),
         ("state/space_writer.bin", space_writer().encode().to_vec()),
+        (
+            "state/space_writer_removed.bin",
+            vlpds::space::rows::WriterRow { removed: true, ..space_writer() }.encode().to_vec(),
+        ),
+        ("state/space_registration.json", space_registration()),
         ("state/space_space.json", space_space().encode().to_vec()),
         ("state/space_notify.json", space_notify()),
         ("state/space_blob_refs.json", space_blob_refs()),
@@ -1065,6 +1086,23 @@ async fn check(level: u32, name: &str, b: &[u8]) {
         "state/space_writer.bin" => {
             let w = vlpds::space::rows::WriterRow::decode(b).unwrap();
             assert!(w.encode() == b);
+        }
+        "state/space_writer_removed.bin" => {
+            let w = vlpds::space::rows::WriterRow::decode(b).unwrap();
+            assert!(w.removed);
+            assert!(w.encode() == b);
+        }
+        "state/space_registration.json" => {
+            let k: BTreeMap<String, String> = serde_json::from_slice(b).unwrap();
+            assert!(pretty(&k) == b);
+            let key = hex::decode(&k["space registration sG/"]).unwrap();
+            assert_eq!(vlsync_store::keys::key_slot(&key), Some(vlsync_store::slots::slot_of(DID)));
+            assert!(vlpds::state::is_space_key(&key));
+            let row = hex::decode(&k["row"]).unwrap();
+            let r = vlpds::space::rows::RegistrationRow::decode(&row).unwrap();
+            assert!(r.encode() == row);
+            let sid = vlpds::state::space_id(SPACE);
+            assert!(vlpds::state::space_registration_key(DID, &sid, &r.id()) == key);
         }
         "state/space_notify.json" => {
             let k: BTreeMap<String, String> = serde_json::from_slice(b).unwrap();

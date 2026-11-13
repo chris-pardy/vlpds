@@ -1,15 +1,23 @@
-//! Forwarding of sequenced writes to the services registered for a space's
-//! notifications (`sN`), as the reference's `processNotifyWrite` queues
-//! them: best effort, after the write is durable, never on the request's
-//! path; a service that misses one catches up with listRepos.
+//! Forwarding of sequenced writer-set updates (a writer's new rev, or its
+//! removal) to the endpoints registered for a space's notifications
+//! (`sG`), as notifySpaceUpdate, as the reference's `forwardSpaceUpdate`
+//! queues them: best effort, after the update is durable, never on the
+//! request's path; a syncer that misses one catches up with listWriters.
 //!
 //! Jobs leave the authority's worker in ack order (so spaceRev order) for
 //! a dispatcher (one of [`DISPATCHERS`], by space, so a space's jobs stay in
 //! order and one big space holds up only its share), which reads the
-//! space's registrations and hands each (space, service) its own lane. A
-//! lane sends one at a time, so a service sees a space's spaceRevs in
-//! order, and a slow one holds up only itself. A taken-down space forwards
-//! nothing.
+//! space's registrations and hands each active (space, registration) its
+//! own lane. A lane sends one at a time, so a syncer sees a space's
+//! spaceRevs in order, and a slow one holds up only itself (the reference
+//! sends each update to its registrations in parallel, unordered). A
+//! taken-down space forwards nothing.
+//!
+//! A registration that lapsed (its credential expired with no renewal) is
+//! sent no more updates: the first update after it lapsed is replaced by a
+//! `registrationExpired` notice, claimed once on the authority's worker and
+//! sent reliably by [`super::notices`]. A shard open's catch-up claims
+//! nothing: it isn't a new update.
 //!
 //! Only a writer's newest state is worth sending: a forward waiting in a
 //! lane is replaced by a newer one of the same writer, and a failed one is
@@ -17,7 +25,7 @@
 //! a lane sends is the last spaceRev it tried to send, so what it skipped
 //! this way leaves no gap (the service pulls the writer from its own last
 //! rev anyway). Otherwise it is the true predecessor from the sequence. A
-//! service may not hear some of them, and a gap only sends it to listRepos;
+//! service may not hear some of them, and a gap only sends it to listWriters;
 //! two forwards naming one prevSpaceRev with different successors would
 //! fork the chain it follows, so the lane's memory counts a send it tried
 //! (which may have arrived though it failed) and is only used within the
@@ -34,10 +42,10 @@
 //! Registrations are capped per space and per authority where they're
 //! made. Sends go over their own pooled guarded client.
 
-use super::host::Forward;
+use super::host::{Forward, WriterUpdate};
 use super::repo::Sequenced;
-use crate::state::SpaceId;
-use std::collections::{HashMap, HashSet, VecDeque};
+use crate::state::{RegId, SpaceId};
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 use vlatproto::tid::Tid;
@@ -61,14 +69,13 @@ pub const RETRY_BASE: Duration = Duration::from_secs(1);
 const RETRY_MAX: Duration = Duration::from_secs(60);
 const ATTEMPTS: u32 = 6;
 
-/// A writer's state the authority just sequenced.
+/// A writer-set update the authority just sequenced.
 pub struct Job {
     pub authority: Arc<str>,
     pub uri: Arc<str>,
     pub sid: SpaceId,
     pub writer: String,
-    pub repo_rev: Tid,
-    pub hash: [u8; 32],
+    pub update: WriterUpdate,
     pub seq: Sequenced,
     /// The lease epoch of the authority's shard that sequenced it.
     pub epoch: u64,
@@ -78,7 +85,7 @@ pub struct Job {
     pub catch_up: bool,
 }
 
-type LaneKey = (Arc<str>, SpaceId, String);
+type LaneKey = (Arc<str>, SpaceId, RegId);
 
 struct Queued {
     f: Forward,
@@ -180,8 +187,6 @@ pub struct Fanout {
     rx: parking_lot::Mutex<Option<Vec<tokio::sync::mpsc::Receiver<Job>>>>,
     sends: Arc<tokio::sync::Semaphore>,
     state: parking_lot::Mutex<State>,
-    /// Expired registrations being pruned.
-    pruning: parking_lot::Mutex<HashSet<(Arc<str>, String)>>,
     /// The first retry's pause.
     retry_base: Duration,
     /// [`TOTAL_QUEUE`] and [`MAX_LANES`]; tests lower them.
@@ -278,7 +283,6 @@ impl Fanout {
             rx: parking_lot::Mutex::new(Some(rx)),
             sends: Arc::new(tokio::sync::Semaphore::new(SENDS)),
             state: Default::default(),
-            pruning: Default::default(),
             retry_base,
             caps: parking_lot::Mutex::new((TOTAL_QUEUE, MAX_LANES)),
         }
@@ -339,7 +343,7 @@ impl Fanout {
                         continue;
                     }
                 }
-                let (regs, expired) = match super::host::registrations(&a, &job.authority, &job.sid).await {
+                let regs = match super::host::registrations(&a, &job.authority, &job.sid).await {
                     Ok(r) => r,
                     Err(e) => {
                         tracing::warn!(space = %hex::encode(job.sid), "space notify registrations unreadable: {e:#}");
@@ -347,19 +351,24 @@ impl Fanout {
                         continue;
                     }
                 };
-                for service in expired {
-                    me.prune(&a, &job.uri, service);
+                let now = vlatproto::tid::now_micros();
+                let (live, lapsed): (Vec<_>, Vec<_>) = regs.into_iter().partition(|r| !r.lapsed(now));
+                let unclaimed: Vec<RegId> = lapsed.iter().filter(|r| !r.expiry_notified).map(|r| r.id()).collect();
+                if !job.catch_up && !unclaimed.is_empty() {
+                    let (a, uri, authority, sid) = (a.clone(), job.uri.clone(), job.authority.clone(), job.sid);
+                    let space_rev = job.seq.space_rev;
+                    tokio::spawn(async move { expire(&a, &uri, &authority, sid, unclaimed, now, space_rev).await });
                 }
                 drop(a);
-                for (service, row) in regs {
+                for row in live {
                     let f = Forward {
                         authority: job.authority.clone(),
                         uri: job.uri.clone(),
-                        service,
+                        reg: row.id(),
                         endpoint: row.endpoint,
+                        token: row.token,
                         writer: job.writer.clone(),
-                        repo_rev: job.repo_rev,
-                        hash: job.hash,
+                        update: job.update,
                         space_rev: job.seq.space_rev,
                         prev_space_rev: job.seq.prev,
                         expires: row.expires,
@@ -370,23 +379,8 @@ impl Fanout {
         });
     }
 
-    /// Deletes an expired registration of `uri` in the background (one
-    /// prune per registration at a time), unless it was renewed meanwhile.
-    pub fn prune(self: &Arc<Self>, app: &Arc<crate::xrpc::App>, uri: &Arc<str>, service: String) {
-        if !self.pruning.lock().insert((uri.clone(), service.clone())) {
-            return;
-        }
-        let (me, app, uri) = (self.clone(), app.clone(), uri.clone());
-        tokio::spawn(async move {
-            if let Err(e) = crate::xrpc::space::prune_registration(&app, &uri, &service).await {
-                tracing::info!(space = %crate::state::space_log_id(&uri), service, "expired space notify registration not pruned: {e:#}");
-            }
-            me.pruning.lock().remove(&(uri, service));
-        });
-    }
-
     fn push(self: &Arc<Self>, app: &Weak<crate::xrpc::App>, sid: SpaceId, f: Forward, epoch: u64) {
-        let key: LaneKey = (f.authority.clone(), sid, f.service.clone());
+        let key: LaneKey = (f.authority.clone(), sid, f.reg);
         let host = host_of(&f.endpoint);
         let (total_cap, lanes_cap) = *self.caps.lock();
         let mut st = self.state.lock();
@@ -490,9 +484,9 @@ impl Fanout {
                     _ => break Sent::Lost,
                 }
                 attempts += 1;
+                // its next update is the expiry notice
                 if q.f.expires <= vlatproto::tid::now_micros() {
                     crate::metrics::space_fanout_dropped("expired");
-                    self.prune(&a, &q.f.uri, q.f.service.clone());
                     break Sent::Lost;
                 }
                 drop(a);
@@ -524,9 +518,33 @@ impl Fanout {
         self.state.lock().lanes.values().map(|l| l.queue.len()).sum()
     }
 
-    /// Lanes held now (each a (space, service)).
+    /// Lanes held now (each a (space, registration)).
     pub fn lanes(&self) -> usize {
         self.state.lock().lanes.len()
+    }
+}
+
+/// The lapsed registrations among `ids` not yet told, claimed on the
+/// authority's worker, are sent `registrationExpired` in place of the
+/// update at `space_rev`.
+async fn expire(
+    app: &Arc<crate::xrpc::App>,
+    uri: &str,
+    authority: &str,
+    sid: SpaceId,
+    ids: Vec<RegId>,
+    now: u64,
+    space_rev: Tid,
+) {
+    match crate::xrpc::space::claim_lapsed(app, uri, ids, now).await {
+        Ok(claimed) if claimed.is_empty() => {}
+        Ok(claimed) => {
+            let notice = super::notices::Notice::Expired { space_rev };
+            super::notices::notify(app, authority, uri, sid, claimed, notice).await;
+        }
+        Err(e) => {
+            tracing::info!(space = %crate::state::space_log_id(uri), "lapsed registrations not claimed: {e:#}");
+        }
     }
 }
 
@@ -574,11 +592,11 @@ mod tests {
         Forward {
             authority: "did:plc:auth".into(),
             uri: "at://did:plc:auth/space/t/k".into(),
-            service: service.into(),
+            reg: crate::state::reg_id("https://syncer.example", service),
             endpoint: "https://syncer.example".into(),
+            token: service.into(),
             writer: writer.into(),
-            repo_rev: Tid(rev),
-            hash: [0; 32],
+            update: WriterUpdate::Write { repo_rev: Tid(rev), hash: [0; 32] },
             space_rev: Tid(rev),
             prev_space_rev: prev.map(Tid),
             expires: u64::MAX,

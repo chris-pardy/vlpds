@@ -153,7 +153,7 @@ async function account(base, name, domain, { oauth }) {
 
 async function createSpace(a, skey) {
   const out = await a.call('com.atproto.space.createSpace', { body: { spaceType: TYPE, skey, policy: MEMBERS } })
-  return out.uri
+  return out.space
 }
 
 async function writeRecords(a, space, n, withBlob) {
@@ -194,7 +194,7 @@ async function seed() {
   ]) {
     member.blobs = {}
     const club = await createSpace(gov, 'club')
-    await gov.call('com.atproto.memberspace.putMember', { body: { space: club, did: member.did, read: true, write: true } })
+    await gov.call('com.atproto.memberspace.putMembers', { body: { space: club, members: [{ did: member.did, read: true, write: true }] } })
     const notes = await createSpace(member, 'notes')
     await writeRecords(member, club, 3, false)
     await writeRecords(member, notes, 4, true)
@@ -426,7 +426,7 @@ async function verify(a) {
     check(got.data === want.data && JSON.stringify(got.records) === JSON.stringify(want.records), `${a.name}: ${space.split('/').pop()} has the same ${want.records.length} records and data`)
     check(got.rev > want.rev, `${a.name}: at a new rev`, `${want.rev} -> ${got.rev}`)
     // importing it again replaces it with the same records
-    const again = await s.xrpc('com.atproto.space.importRepo', { bytes: star, type: 'application/octet-stream' }).then(() => null, (e) => e.message)
+    const again = await s.xrpc('com.atproto.space.importRepo', { bytes: star, type: 'application/vnd.dasl.star' }).then(() => null, (e) => e.message)
     const after = await verifiedRepo(await s.xrpc('com.atproto.space.getRepo', { params: { space, repo: a.did }, raw: true }), space, a.did)
     check(!again && after.data === want.data && JSON.stringify(after.records) === JSON.stringify(want.records), `${a.name}: re-importing ${space.split('/').pop()} changes nothing`, again ?? '')
   }

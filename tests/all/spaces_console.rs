@@ -1,7 +1,7 @@
 //! The console's Spaces pages (src/xrpc/space_ops.rs): admin only, 501
 //! without `--spaces`, metadata only, and the one action audited.
 
-use crate::common::spaces::SpaceClient;
+use crate::common::spaces::{put_members, SpaceClient};
 use crate::common::*;
 use std::time::Duration;
 
@@ -31,32 +31,28 @@ async fn eventually(within: Duration, mut f: impl AsyncFnMut() -> bool) -> bool 
 
 async fn put_member(owner: &SpaceClient, space: &str, did: &str) {
     let body = json!({"space": space, "did": did, "read": true, "write": true});
-    owner.post("com.atproto.memberspace.putMember", body).await.ok();
+    owner.post("com.atproto.memberspace.putMembers", put_members(body)).await.ok();
 }
 
-/// A did:web syncer on loopback that takes every notify.
+/// A syncer on loopback that confirms its registrations and takes every
+/// notify: its endpoint.
 async fn syncer() -> String {
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = l.local_addr().unwrap();
-    let (base, did) = (format!("http://{addr}"), format!("did:web:127.0.0.1%3A{}", addr.port()));
-    let d = did.clone();
-    let router = axum::Router::new().fallback(move |req: axum::extract::Request| {
-        let (d, b) = (d.clone(), base.clone());
-        async move {
-            let body = match req.uri().path() {
-                "/.well-known/did.json" => {
-                    json!({"id": d, "service": [{"id": "#sync", "type": "Test", "serviceEndpoint": b}]})
-                }
-                _ => json!({}),
-            };
-            axum::response::Response::builder()
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(body.to_string()))
-                .unwrap()
-        }
+    let base = format!("http://{}", l.local_addr().unwrap());
+    let router = axum::Router::new().fallback(move |req: axum::extract::Request| async move {
+        let confirm = req.uri().path() == crate::common::spaces::CONFIRM_REGISTRATION;
+        let raw = axum::body::to_bytes(req.into_body(), 1 << 20).await.unwrap_or_default();
+        let body = match confirm {
+            true => crate::common::spaces::confirmed(&serde_json::from_slice(&raw).unwrap_or_default()),
+            false => json!({}),
+        };
+        axum::response::Response::builder()
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap()
     });
     tokio::spawn(async move { axum::serve(l, router).await.unwrap() });
-    format!("{did}#sync")
+    base
 }
 
 const READS: [&str; 4] = [
@@ -197,10 +193,9 @@ async fn registration_removal_is_audited() {
     let owner = SpaceClient::new(&s, "scr", OWNER).await;
     let space = owner.create_space(TYPE, "main").await;
     let other = owner.create_space(TYPE, "other").await;
-    let service = syncer().await;
-    let cred = owner.credential(&space).await;
-    let reg = json!({"space": space, "service": service});
-    owner.signed_post(&s.url, "com.atproto.space.registerNotify", reg, &cred, &owner.did).await.ok();
+    let endpoint = syncer().await;
+    owner.register(&space, &endpoint, "tok").await.ok();
+    let service = hex::encode(vlpds::state::reg_id(&endpoint, "tok"));
     let q = [("did", owner.did.as_str()), ("uri", space.as_str())];
     let d = s.xrpc.get("vlpds.admin.getSpaceInfo", &q, &Auth::Admin).await.ok();
     let regs = d["registrations"].as_array().unwrap();

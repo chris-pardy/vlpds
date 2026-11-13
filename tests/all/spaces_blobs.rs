@@ -5,7 +5,7 @@
 //! GC keeps a blob while any space record names it. Without the flag a
 //! fresh upload is still served before any record names it.
 
-use crate::common::spaces::SpaceClient;
+use crate::common::spaces::{put_members, SpaceClient};
 use crate::common::*;
 use object_store::ObjectStoreExt;
 use std::sync::Arc;
@@ -98,8 +98,8 @@ async fn space_blobs_are_served_only_through_their_space() {
     let other = owner.create_space(TYPE, "other").await;
     let r = owner
         .post(
-            "com.atproto.memberspace.putMember",
-            json!({"space": space, "did": member.did, "read": true, "write": false}),
+            "com.atproto.memberspace.putMembers",
+            put_members(json!({"space": space, "did": member.did, "read": true, "write": false})),
         )
         .await;
     r.ok();
@@ -172,9 +172,11 @@ async fn space_blobs_are_served_only_through_their_space() {
     let (later, _) = upload(&s, &owner, 5).await;
     // `a` now names `later` instead of `only`
     owner.put_record(&space, COLL, "a", rec("a2", &[&later])).await.ok();
-    let r = list(&s, &member, &cred, &space, o, &[("since", &rev)]).await.ok();
-    assert_eq!(cids(&r), vec![cid(&later)]);
-    list(&s, &member, &cred, &space, o, &[("since", "nope")]).await.err(400, "InvalidRequest");
+    // `since` is gone since the Nov 12 alpha: every blob named now
+    let now = list(&s, &member, &cred, &space, o, &[]).await.ok();
+    assert!(cids(&now).contains(&cid(&later)) && !cids(&now).contains(&cid(&only)), "{now}");
+    assert_eq!(cids(&list(&s, &member, &cred, &space, o, &[("since", &rev)]).await.ok()), cids(&now));
+    list(&s, &member, &cred, &space, o, &[("since", "nope")]).await.ok();
     get(&s, &member, &cred, &space, o, &only).await.err(400, "BlobNotFound");
     assert_eq!(get(&s, &member, &cred, &space, o, &later).await.status, 200);
     s.get_blob(&owner.did, &cid(&later)).await.err(400, "BlobNotFound");

@@ -4,8 +4,12 @@ boards is a small Reddit-like message board built on atproto Spaces. Each board 
 and members post, comment and vote in their own space repos. The app lives in `packages/boards`
 (its README.md covers the production server at boards.example.com). This directory runs it on the
 harness stack in `bench/spaces` (README.md there) to test vlpds's Spaces code through the flows a
-real app runs. `harness.mjs` wires the app to the harness's PLC and accounts, and `lib/space.mjs`
-and `lib/syncer.mjs` run on the app's Spaces client (`packages/boards/src/spaces/`).
+real app runs. `harness.mjs` wires the app to the harness's PLC and accounts.
+
+The app isn't in this repository, and its Spaces client (`packages/boards/src/spaces/`) is still on
+the Nov 5 wire. The harness moved to the Nov 12 one (`lib/space.mjs` and `lib/syncer.mjs` no longer
+import the app's client), and `scenarios.mjs` names the Nov 12 methods, but these stories haven't
+run since: they need the app ported first (`BOARDS_DIR` points `run.sh` at a checkout of it).
 
 ```
 just spaces-boards                  # every story in all-vlpds, vlpds-owner, ref-owner and all-ref
@@ -49,7 +53,7 @@ reports not impl.
 
 `packages/boards/src/appview.mjs` is the indexer and API. The owner adds the appview's account as a read-only member and
 calls `indexBoard`. The appview registers for notifies and syncs every member repo with the
-app's `SpaceSyncer` (listRepos from a spaceRev checkpoint, listRepoOps with a running LtHash checked
+app's `SpaceSyncer` (listWriters from a spaceRev checkpoint, listRepoOps with a running LtHash checked
 against the commit once its MAC verifies, a verified STAR getRepo on a mismatch). It holds nothing it didn't get that
 way. A poll every 2 s catches what nothing pushes, which today is a record takedown. `src/model.mjs`
 turns the synced repos into the board, and the scenario runner runs the same function over the
@@ -64,8 +68,8 @@ non-member can't read a board through the appview either, and the appview honour
 The board rules, as `model.mjs` has them:
 
 - A removed member's posts, comments and votes are hidden. Removal takes the member out of the
-  writer set, so listRepos stops naming them, but it isn't announced: a syncer that already holds
-  their repo keeps it, and one that starts later never pulls it. Hiding by `settings.removed` gives
+  writer set, so listWriters lists them as removed and registered syncers get a `repoRemoved`. A
+  syncer that misses it keeps their repo until it next lists the writer set. Hiding by `settings.removed` gives
   every appview the same board.
 - A comment whose post is gone isn't shown. A reply whose parent is gone hangs under a `[removed]`
   placeholder.
@@ -81,11 +85,11 @@ The board rules, as `model.mjs` has them:
 | 2.post-comment-vote | a post with an image, a two-deep thread, votes changed and taken back. Scores, threads, karma and the three sorts match the model and hand-counted numbers. The image comes back from `space.getBlob` and the appview, and `sync.getBlob` answers `BlobNotFound` |
 | 3.lurker-outsider | dave reads everything. His own-repo writes go untracked and never show (the reference rule), and he can't write into bob's repo. eve gets no credential (`SpaceNotFound`), and the appview refuses her own board's credential and a stolen one signed with her key |
 | 4.edit-delete-converge | 40 edits, comments and deletes with the appview's poll off, so only notifies move it. Reports ack-to-visible p50 and p99 |
-| 5.remove-member | carol loses her credential (`SpaceNotFound`) and drops out of listRepos. Her content disappears from the appview |
+| 5.remove-member | carol loses her credential (`SpaceNotFound`) and is listed as removed in listWriters. Her content disappears from the appview |
 | 6.takedown | an operator takes bob's post down (vlpds only). It's gone from every read, its image answers `BlobNotFound`, and the appview converges without it. `vlpds.admin.getSpaceRecord` reads it flagged `takendown` and the read is audited. A reversal brings it all back |
 | 8.revoke | alice revokes a stolen credential on every member host and the appview. Reads with it fail with `CredentialRevoked` |
 | 10.scale | 20 members, 200 posts, 1,000 comments and 3,000 votes, 16 in flight. Nothing acked is lost, and the appview matches the model on every post, thread and karma. Reports throughput, appview catch-up and vlpds bucket ops per write |
-| 11.fault | `CLUSTER=1` only. vlpds node 1 gets `kill -9` 30% into story 10 and stays down 20 s. The board keeps taking writes, no acked write is lost and listRepos ends at every writer's head |
+| 11.fault | `CLUSTER=1` only. vlpds node 1 gets `kill -9` 30% into story 10 and stays down 20 s. The board keeps taking writes, no acked write is lost and listWriters ends at every writer's head |
 | 9.delete-board | `SpaceDeleted` for credentials, `notifySpaceDeleted` to the appview, which drops the board. Members keep their own repos (the reference sweeps only the authority's rows) |
 | 7.privacy | runs last. Every board write carries the run's sentinel. No firehose frame (live or a cursor-0 backfill), `getRepo`, `listBlobs` or `getBlob` shows it, and no member's public repo rev moved |
 

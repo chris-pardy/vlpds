@@ -691,14 +691,14 @@ registerDetail('space', {
       </Sec>
     )
     const regs = (
-      <Sec title="Notify registrations" digest={plural(d.registrations.length, 'service')} open={page || d.registrations.length > 0} flush>
+      <Sec title="Notify registrations" digest={plural(d.registrations.length, 'registration')} open={page || d.registrations.length > 0} flush>
         {d.registrations.length ? (
           <DataTable
             compact
             rows={d.registrations}
             rowKey={(r) => r.service}
             cols={[
-              { id: 's', label: 'Service', render: (r) => <Copy text={r.service}>{r.service.length > 32 ? `${r.service.slice(0, 32)}…` : r.service}</Copy> },
+              { id: 's', label: 'Registration', render: (r) => <Copy text={r.service}>{r.service.length > 32 ? `${r.service.slice(0, 32)}…` : r.service}</Copy> },
               { id: 'h', label: 'Host', render: (r) => <span className="mono sm">{r.host ?? '—'}</span> },
               { id: 'e', label: 'Expires', render: (r) => (r.expired ? <Chip k="idle">expired</Chip> : r.expiresAt ? ago(Date.parse(r.expiresAt)) : '—') },
               {
